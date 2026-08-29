@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "starcat-history-builder"
+version = "0.1.0"
+description = "Starcat Star History 本地快照与增量构建器"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "duckdb>=1.4,<2",
+  "pytz>=2025.2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.4,<10"]
+
+[project.scripts]
+starcat-history-builder = "starcat_history_builder.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
