@@ -42,9 +42,9 @@ type RepositoryMetadata struct {
 
 // ActiveState 描述当前对外服务的数据版本。
 type ActiveState struct {
-	ModelVersion    string
-	ActiveWatermark string
-	GeneratedAt     time.Time
+	ModelVersion    string    `json:"model_version"`
+	ActiveWatermark string    `json:"active_watermark"`
+	GeneratedAt     time.Time `json:"generated_at"`
 }
 
 // Stats 是控制台可消费的有界运行统计。

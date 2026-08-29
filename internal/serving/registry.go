@@ -98,7 +98,11 @@ func NewRegistry(root, bootstrapStoreFile string) (*Registry, error) {
 		if err := json.Unmarshal(payload, &pointer); err != nil || !identifierPattern.MatchString(pointer.ModelVersion) {
 			return nil, fmt.Errorf("restore active history pointer: %w", ErrInvalidBundle)
 		}
-		store, err := Open(filepath.Join(registry.versions, pointer.ModelVersion, snapshotDatabaseFile))
+		directory := filepath.Join(registry.versions, pointer.ModelVersion)
+		if _, err := verifySnapshot(directory, pointer.ModelVersion); err != nil {
+			return nil, fmt.Errorf("restore active history snapshot: %w", err)
+		}
+		store, err := Open(filepath.Join(directory, snapshotDatabaseFile))
 		if err != nil {
 			return nil, err
 		}
@@ -423,6 +427,22 @@ func verifySnapshot(directory, version string) (SnapshotManifest, error) {
 	if err := verifySQLite(filepath.Join(directory, snapshotDatabaseFile), []string{"repo_history_series", "repository_metadata", "history_active", "applied_deltas"}); err != nil {
 		return SnapshotManifest{}, err
 	}
+	database, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(directory, snapshotDatabaseFile))+"?mode=ro")
+	if err != nil {
+		return SnapshotManifest{}, err
+	}
+	defer database.Close()
+	var repositories, eventDays, watchEvents int64
+	if err := database.QueryRow(`SELECT COUNT(*), COALESCE(SUM(point_count), 0), COALESCE(SUM(event_total), 0) FROM repo_history_series`).Scan(&repositories, &eventDays, &watchEvents); err != nil {
+		return SnapshotManifest{}, err
+	}
+	if repositories != manifest.Repositories || eventDays != manifest.EventDays || watchEvents != manifest.WatchEvents {
+		return SnapshotManifest{}, fmt.Errorf("%w: snapshot statistics do not match manifest", ErrInvalidBundle)
+	}
+	var activeVersion, activeWatermark string
+	if err := database.QueryRow(`SELECT model_version, active_watermark FROM history_active WHERE id = 1`).Scan(&activeVersion, &activeWatermark); err != nil || activeVersion != manifest.ModelVersion || activeWatermark != manifest.SourceWatermark {
+		return SnapshotManifest{}, fmt.Errorf("%w: snapshot active state does not match manifest", ErrInvalidBundle)
+	}
 	return manifest, nil
 }
 
@@ -434,6 +454,11 @@ func verifyDelta(directory, deltaID string) (DeltaManifest, []DeltaRow, error) {
 	var manifest DeltaManifest
 	if err := json.Unmarshal(payload, &manifest); err != nil || manifest.SchemaVersion != 1 || manifest.Kind != "history_delta" || manifest.DeltaID != deltaID || manifest.FromWatermark == "" || manifest.ToWatermark == "" || manifest.CreatedAt.IsZero() {
 		return DeltaManifest{}, nil, fmt.Errorf("%w: invalid delta manifest", ErrInvalidBundle)
+	}
+	fromDate, fromErr := time.Parse("2006-01-02", manifest.FromWatermark)
+	toDate, toErr := time.Parse("2006-01-02", manifest.ToWatermark)
+	if fromErr != nil || toErr != nil || !toDate.Equal(fromDate.AddDate(0, 0, 1)) {
+		return DeltaManifest{}, nil, fmt.Errorf("%w: delta watermarks must be adjacent UTC dates", ErrInvalidBundle)
 	}
 	path := filepath.Join(directory, deltaDatabaseFile)
 	if err := verifySQLite(path, []string{"repo_star_daily_delta"}); err != nil {

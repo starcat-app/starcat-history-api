@@ -84,15 +84,20 @@ func (h *HistoryHandler) HandleStarHistory(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if errors.Is(err, provider.ErrRateLimited) {
-		writeError(w, http.StatusServiceUnavailable, "GITHUB_RATE_LIMITED", "GitHub metadata is temporarily unavailable.", nil)
+		w.Header().Set("Retry-After", "60")
+		writeError(w, http.StatusTooManyRequests, "GITHUB_RATE_LIMITED", "GitHub metadata is temporarily unavailable.", nil)
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "GITHUB_ERROR", "Unable to refresh repository metadata.", nil)
+		writeError(w, http.StatusServiceUnavailable, "GITHUB_ERROR", "Unable to refresh repository metadata.", nil)
 		return
 	}
-	if metadata.RepoID != repoID || metadata.Visibility != "public" {
-		writeError(w, http.StatusNotFound, "REPOSITORY_NOT_FOUND", "Repository was not found.", nil)
+	if metadata.RepoID != repoID {
+		writeError(w, http.StatusConflict, "REPOSITORY_ID_MISMATCH", "Repository ID does not match the requested path.", nil)
+		return
+	}
+	if metadata.Visibility != "public" {
+		writeError(w, http.StatusUnprocessableEntity, "PRIVATE_REPOSITORY", "Private and internal repositories are not served.", nil)
 		return
 	}
 
