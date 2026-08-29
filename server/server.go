@@ -131,6 +131,7 @@ func New(opt Options) (*Service, error) {
 	mux.HandleFunc("GET /healthz", healthzHandler)
 	mux.Handle("GET /api/v1/ping", auth.Wrap(handler.HandlePing(Name(), version.Version)))
 	mux.Handle("GET /api/v1/repos/{owner}/{repo}/star-history", auth.Wrap(http.HandlerFunc(historyHandler.HandleStarHistory)))
+	mux.Handle("GET /api/v1/repos/{owner}/{repo}/star-history/events", auth.Wrap(http.HandlerFunc(historyHandler.HandleStarHistoryEvents)))
 	mux.Handle("GET /internal/stats", auth.Wrap(handler.HandleStats(registry)))
 	mux.Handle("GET /internal/metrics/summary", auth.Wrap(http.HandlerFunc(metricsHandler.HandleSummary)))
 	mux.Handle("GET /internal/metrics/timeseries", auth.Wrap(http.HandlerFunc(metricsHandler.HandleTimeseries)))
@@ -147,6 +148,7 @@ func New(opt Options) (*Service, error) {
 	if !opt.SkipListenLogEndpoints {
 		log.Printf("starcat-history-api %s endpoints ready", version.Version)
 		log.Printf("  GET /api/v1/repos/{owner}/{repo}/star-history")
+		log.Printf("  GET /api/v1/repos/{owner}/{repo}/star-history/events")
 		log.Printf("  GET /internal/stats")
 		if len(opt.PublishKeys) > 0 {
 			log.Printf("  POST /internal/v1/history-snapshots/{model_version}")

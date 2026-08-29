@@ -114,6 +114,57 @@ watch-history-20260825-v1/
 └── watch-history-20260825-v1.zip
 ```
 
+## 本地安装 Snapshot（推荐联调）
+
+本机只跑查询时，**只需 `history.sqlite`**，不必拷贝 `manifest.json` / `checksums.json` / `*.zip`，也不必拷 Silver / Raw Parquet。
+
+先停掉占用 `5014` 的 history-api，再执行：
+
+```bash
+# 停服务后再装，避免半截 WAL
+make install-local-snapshot \
+  SNAPSHOT=/Volumes/T0/Starcat/history/snapshots/watch-history-20260825-v1
+
+# 目标已存在时覆盖
+make install-local-snapshot \
+  SNAPSHOT=/Volumes/T0/Starcat/history/snapshots/watch-history-20260825-v1 \
+  FORCE=1
+```
+
+等价脚本：
+
+```bash
+scripts/install-local-snapshot.sh \
+  /Volumes/T0/Starcat/history/snapshots/watch-history-20260825-v1
+
+# 也可直接传 sqlite 路径
+scripts/install-local-snapshot.sh \
+  /Volumes/T0/Starcat/history/snapshots/watch-history-20260825-v1/history.sqlite \
+  --force
+```
+
+默认写入 `.env` 的 `STORE_FILE`（未配置则 `./data/history.sqlite`）。脚本会：
+
+1. 拒绝在端口仍监听时覆盖（除非 `--allow-running`）
+2. 校验源库含 `repo_history_series` / `history_active`
+3. 原子替换目标库，并清理旧的 `-wal` / `-shm`
+4. 打印 active 水位与仓库数
+
+然后启动：
+
+```bash
+make run
+curl -fsS http://127.0.0.1:5014/healthz
+curl -fsS -H 'Authorization: Bearer local-history-client-key' \
+  http://127.0.0.1:5014/internal/stats | jq .
+```
+
+说明：
+
+- 这条路径走 **bootstrap `STORE_FILE`**，`data/history-registry` 可以为空。
+- 正式环境或需要日增量时，仍用下面的 `publish-bundle.sh`（ZIP → Registry 激活）。
+- `history-registry/`、Silver、Raw 数据**不需要**为本地查询再拷一份。
+
 ## 构建每日 Delta
 
 Delta 是 `(from_watermark, to_watermark]` 的相邻 UTC 日增量，服务端会拒绝日期缺口：
@@ -161,15 +212,31 @@ export HISTORY_GATEWAY_SERVICE=history
 
 ## 查询 Star 历史
 
+第三方兼容接口（服务端校准曲线；可选传入本地已知星标数以避免打 GitHub）：
+
 ```bash
 curl -fsS \
   -H 'Authorization: Bearer local-history-client-key' \
   -H 'X-SC-Svc: history' \
-  'http://127.0.0.1:8080/api/v1/repos/vinta/awesome-python/star-history?repo_id=21289110&range=all' \
+  'http://127.0.0.1:5014/api/v1/repos/vinta/awesome-python/star-history?repo_id=21289110&range=all&current_stars=120000' \
   | jq .
 ```
 
-支持 `range=3m|1y|all`、`ETag` / `If-None-Match`。Private/Internal 仓库不提供公共数据。
+- `current_stars` 可选。合法非负整数时直接 `Normalize`，不访问 GitHub。
+- 未传时回退 GitHub metadata（含本地 metadata 缓存）。
+- 支持 `range=3m|1y|all`、`ETag` / `If-None-Match`。Private/Internal 在走 GitHub 路径时仍会拒绝。
+
+Starcat 专用原始事件接口（不访问 GitHub，由客户端用本地 `stars_count` 校准）：
+
+```bash
+curl -fsS \
+  -H 'Authorization: Bearer local-history-client-key' \
+  -H 'X-SC-Svc: history' \
+  'http://127.0.0.1:5014/api/v1/repos/vinta/awesome-python/star-history/events?repo_id=21289110' \
+  | jq .
+```
+
+`events[].count` 是当日 WatchEvent 数，不是累计星标。
 
 ## 接口
 
@@ -177,7 +244,8 @@ curl -fsS \
 |---|---|---|---|
 | GET | `/healthz` | 无 | 进程健康检查 |
 | GET | `/api/v1/ping` | `API_KEYS` | 客户端连接检查 |
-| GET | `/api/v1/repos/{owner}/{repo}/star-history` | `API_KEYS` | 查询公开仓库曲线 |
+| GET | `/api/v1/repos/{owner}/{repo}/star-history` | `API_KEYS` | 查询公开仓库校准曲线（第三方） |
+| GET | `/api/v1/repos/{owner}/{repo}/star-history/events` | `API_KEYS` | 查询原始日事件（Starcat） |
 | GET | `/internal/stats` | `API_KEYS` | Serving 规模与水位 |
 | GET | `/internal/metrics/*` | `API_KEYS` | 调用统计 |
 | POST | `/internal/v1/history-snapshots/{version}?activate=true` | `PUBLISH_KEYS` | 安装/激活快照 |
