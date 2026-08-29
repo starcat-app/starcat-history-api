@@ -24,10 +24,12 @@ import (
 )
 
 const (
-	defaultPort           = "5014"
-	defaultRegistryDir    = "./data/history-registry"
-	defaultStoreFile      = "./data/history.sqlite"
-	defaultMaxBundleBytes = int64(2 << 30)
+	defaultPort        = "5014"
+	defaultRegistryDir = "./data/history-registry"
+	defaultStoreFile   = "./data/history.sqlite"
+	// 全量 4000 万级仓库快照可能超过 2 GiB，默认上限保留到 16 GiB；
+	// 实际 Fly 卷容量与上传窗口仍由运维侧单独控制。
+	defaultMaxBundleBytes = int64(16 << 30)
 )
 
 // Options 控制 History 服务装配。
@@ -67,11 +69,11 @@ func FromEnv() (*Service, error) {
 	return New(Options{
 		Port:             kitenv.OrDefault("PORT", defaultPort),
 		APIKeys:          apiKeys,
-		PublishKeys:      optionalListEnv("HISTORY_PUBLISH_KEYS"),
+		PublishKeys:      optionalListEnv("PUBLISH_KEYS"),
 		GitHubToken:      strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
 		GitHubEndpoint:   kitenv.OrDefault("GITHUB_API_ENDPOINT", "https://api.github.com"),
-		StoreFile:        envOrDefault("HISTORY_STORE_FILE", defaultStoreFile),
-		RegistryDir:      envOrDefault("HISTORY_REGISTRY_DIR", defaultRegistryDir),
+		StoreFile:        envOrDefault("STORE_FILE", defaultStoreFile),
+		RegistryDir:      envOrDefault("REGISTRY_DIR", defaultRegistryDir),
 		MetricsStoreFile: envOrDefault("METRICS_STORE_FILE", "./data/history-metrics.db"),
 		MetadataTTL:      kitenv.DurationSeconds("METADATA_TTL_SECONDS", 24*time.Hour),
 		MaximumPoints:    intEnv("MAXIMUM_HISTORY_POINTS", series.DefaultMaximumPoints),
