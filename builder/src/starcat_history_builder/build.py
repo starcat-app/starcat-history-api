@@ -77,7 +77,9 @@ def _aggregate_sql(
     where = ["repo_id IS NOT NULL", "repo_id > 0", f"{timestamp} IS NOT NULL"]
     parameters: list[Any] = []
     if has_relation_type:
-        where.append("relation_type = 'watch'")
+        # Raw WatchEvent 没有 relation_type；Trainer Canonical 当前规范值是 star_event。
+        # 同时接受旧实验数据的 watch，避免同一语义因字段枚举差异被静默过滤为空。
+        where.append("relation_type IN ('watch', 'star_event')")
     if repo_ids:
         placeholders = ",".join("?" for _ in repo_ids)
         where.append(f"repo_id IN ({placeholders})")

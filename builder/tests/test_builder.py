@@ -30,6 +30,23 @@ def _parquet(path: Path) -> None:
     connection.close()
 
 
+def _canonical_parquet(path: Path) -> None:
+    connection = duckdb.connect()
+    connection.execute(
+        """
+        COPY (
+            SELECT * FROM (VALUES
+                (7::BIGINT, 'star_event', TIMESTAMPTZ '2026-08-25 01:00:00+00'),
+                (7::BIGINT, 'star_event', TIMESTAMPTZ '2026-08-25 02:00:00+00'),
+                (7::BIGINT, 'push_event', TIMESTAMPTZ '2026-08-25 03:00:00+00')
+            ) AS events(repo_id, relation_type, occurred_at)
+        ) TO ? (FORMAT PARQUET)
+        """,
+        [str(path)],
+    )
+    connection.close()
+
+
 def test_build_snapshot_and_delta(tmp_path: Path) -> None:
     source = tmp_path / "watch.parquet"
     _parquet(source)
@@ -50,3 +67,15 @@ def test_build_snapshot_and_delta(tmp_path: Path) -> None:
     delta_zip = build_delta([str(source)], tmp_path / "delta-out", "delta-1", "2026-08-24", "2026-08-25", options)
     with sqlite3.connect(delta_zip.parent / "history-delta.sqlite") as database:
         assert database.execute("SELECT COUNT(*) FROM repo_star_daily_delta").fetchone()[0] == 2
+
+
+def test_canonical_star_event_is_not_filtered_out(tmp_path: Path) -> None:
+    source = tmp_path / "canonical.parquet"
+    _canonical_parquet(source)
+    options = DuckDBOptions(temp_directory=tmp_path / "spill", memory_limit="1GB", threads=1)
+    snapshot_zip = build_snapshot(
+        [str(source)], tmp_path / "out", "canonical-v1", "2026-08-25", options, [7]
+    )
+    manifest = json.loads((snapshot_zip.parent / "manifest.json").read_text())
+    assert manifest["repositories"] == 1
+    assert manifest["watch_events"] == 2
