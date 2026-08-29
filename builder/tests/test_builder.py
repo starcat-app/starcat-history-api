@@ -9,7 +9,7 @@ from pathlib import Path
 
 import duckdb
 
-from starcat_history_builder.build import DuckDBOptions, build_delta, build_snapshot
+from starcat_history_builder.build import DuckDBOptions, build_delta, build_silver, build_snapshot
 
 
 def _parquet(path: Path) -> None:
@@ -79,3 +79,22 @@ def test_canonical_star_event_is_not_filtered_out(tmp_path: Path) -> None:
     manifest = json.loads((snapshot_zip.parent / "manifest.json").read_text())
     assert manifest["repositories"] == 1
     assert manifest["watch_events"] == 2
+
+
+def test_silver_can_rebuild_snapshot(tmp_path: Path) -> None:
+    source = tmp_path / "watch.parquet"
+    _parquet(source)
+    options = DuckDBOptions(temp_directory=tmp_path / "spill", memory_limit="1GB", threads=1)
+    silver = build_silver([str(source)], tmp_path / "silver-out", "silver-v1", "2026-08-25", options)
+    manifest = json.loads((silver / "manifest.json").read_text())
+    assert manifest["repositories"] == 2
+    assert manifest["event_days"] == 3
+    snapshot_zip = build_snapshot(
+        [str(silver / "data" / "**" / "*.parquet")],
+        tmp_path / "snapshot-out",
+        "from-silver-v1",
+        "2026-08-25",
+        options,
+    )
+    snapshot_manifest = json.loads((snapshot_zip.parent / "manifest.json").read_text())
+    assert snapshot_manifest["watch_events"] == 4

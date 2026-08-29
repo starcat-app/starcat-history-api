@@ -37,7 +37,7 @@ class DuckDBOptions:
 def _resolve_inputs(patterns: list[str]) -> list[str]:
     paths: list[str] = []
     for pattern in patterns:
-        matches = sorted(glob.glob(pattern))
+        matches = sorted(glob.glob(pattern, recursive=True))
         if not matches and Path(pattern).is_file():
             matches = [pattern]
         paths.extend(matches)
@@ -58,22 +58,51 @@ def _connect(options: DuckDBOptions) -> duckdb.DuckDBPyConnection:
     return connection
 
 
-def _timestamp_column(connection: duckdb.DuckDBPyConnection, inputs: list[str]) -> tuple[str, bool]:
+def _input_shape(connection: duckdb.DuckDBPyConnection, inputs: list[str]) -> tuple[str | None, bool]:
     columns = {row[0] for row in connection.execute("DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)", [inputs]).fetchall()}
+    if "repo_id" not in columns:
+        raise ValueError("输入必须包含 repo_id")
+    if {"event_day", "event_count"}.issubset(columns):
+        return None, False
     timestamp = "occurred_at" if "occurred_at" in columns else "created_at" if "created_at" in columns else ""
-    if not timestamp or "repo_id" not in columns:
-        raise ValueError("输入必须包含 repo_id 和 occurred_at/created_at")
+    if not timestamp:
+        raise ValueError("输入必须包含 event_day/event_count 或 occurred_at/created_at")
     return timestamp, "relation_type" in columns
 
 
 def _aggregate_sql(
-    timestamp: str,
+    timestamp: str | None,
     has_relation_type: bool,
     repo_ids: list[int],
     *,
     from_exclusive: str | None = None,
     to_inclusive: str | None = None,
+    ordered: bool = True,
 ) -> tuple[str, list[Any]]:
+    if timestamp is None:
+        where = ["repo_id IS NOT NULL", "repo_id > 0", "event_day IS NOT NULL", "event_count > 0"]
+        parameters: list[Any] = []
+        if repo_ids:
+            placeholders = ",".join("?" for _ in repo_ids)
+            where.append(f"repo_id IN ({placeholders})")
+            parameters.extend(repo_ids)
+        if from_exclusive:
+            where.append("event_day > date_diff('day', DATE '1970-01-01', CAST(? AS DATE))")
+            parameters.append(from_exclusive)
+        if to_inclusive:
+            where.append("event_day <= date_diff('day', DATE '1970-01-01', CAST(? AS DATE))")
+            parameters.append(to_inclusive)
+        order_clause = "ORDER BY repo_id, event_day" if ordered else ""
+        return f"""
+            SELECT CAST(repo_id AS BIGINT) AS repo_id,
+                   CAST(event_day AS INTEGER) AS event_day,
+                   CAST(SUM(event_count) AS BIGINT) AS event_count
+            FROM read_parquet(?, union_by_name=true, hive_partitioning=true)
+            WHERE {' AND '.join(where)}
+            GROUP BY repo_id, event_day
+            {order_clause}
+        """, parameters
+
     where = ["repo_id IS NOT NULL", "repo_id > 0", f"{timestamp} IS NOT NULL"]
     parameters: list[Any] = []
     if has_relation_type:
@@ -91,6 +120,7 @@ def _aggregate_sql(
     if to_inclusive:
         where.append(f"{utc_date} <= CAST(? AS DATE)")
         parameters.append(to_inclusive)
+    order_clause = "ORDER BY repo_id, event_day" if ordered else ""
     sql = f"""
         SELECT
             CAST(repo_id AS BIGINT) AS repo_id,
@@ -99,7 +129,7 @@ def _aggregate_sql(
         FROM read_parquet(?, union_by_name=true)
         WHERE {' AND '.join(where)}
         GROUP BY repo_id, event_day
-        ORDER BY repo_id, event_day
+        {order_clause}
     """
     return sql, parameters
 
@@ -136,7 +166,7 @@ def build_snapshot(
     database: sqlite3.Connection | None = None
     try:
         connection = _connect(duckdb_options)
-        timestamp, has_relation_type = _timestamp_column(connection, resolved)
+        timestamp, has_relation_type = _input_shape(connection, resolved)
         sql, parameters = _aggregate_sql(timestamp, has_relation_type, repo_ids, to_inclusive=watermark)
         cursor = connection.execute(sql, [resolved, *parameters])
 
@@ -227,7 +257,7 @@ def build_delta(
     database: sqlite3.Connection | None = None
     try:
         connection = _connect(duckdb_options)
-        timestamp, has_relation_type = _timestamp_column(connection, resolved)
+        timestamp, has_relation_type = _input_shape(connection, resolved)
         sql, parameters = _aggregate_sql(
             timestamp,
             has_relation_type,
@@ -284,6 +314,93 @@ def _finish_bundle(staging: Path, final: Path, manifest: dict[str, Any], databas
         for name in ("manifest.json", "checksums.json", database_name):
             archive.write(staging / name, arcname=name)
     os.replace(staging, final)
+
+
+def build_silver(
+    inputs: list[str],
+    output_dir: Path,
+    dataset_id: str,
+    watermark: str,
+    duckdb_options: DuckDBOptions,
+) -> Path:
+    """把 Raw/Canonical 聚合为按年份分区的 repo/day Silver Parquet Dataset。"""
+    resolved = _resolve_inputs(inputs)
+    staging, final = _prepare_destination(output_dir, dataset_id)
+    connection: duckdb.DuckDBPyConnection | None = None
+    try:
+        connection = _connect(duckdb_options)
+        timestamp, has_relation_type = _input_shape(connection, resolved)
+        if timestamp is None:
+            raise ValueError("Silver 构建输入必须是 Raw/Canonical，不能再次输入 Silver")
+        aggregate_sql, parameters = _aggregate_sql(
+            timestamp,
+            has_relation_type,
+            [],
+            to_inclusive=watermark,
+            ordered=False,
+        )
+        data_directory = staging / "data"
+        data_directory.mkdir()
+        # 先聚合再按事件年份分区。年份分区既便于逐年审计，也避免生成数千个日目录。
+        output_literal = str(data_directory).replace("'", "''")
+        copy_sql = f"""
+            COPY (
+                SELECT repo_id, event_day, event_count,
+                       year(DATE '1970-01-01' + event_day) AS event_year
+                FROM ({aggregate_sql})
+            ) TO '{output_literal}' (
+                FORMAT PARQUET,
+                COMPRESSION ZSTD,
+                PARTITION_BY (event_year),
+                ROW_GROUP_SIZE 100000,
+                FILENAME_PATTERN 'part_{{uuid}}'
+            )
+        """
+        # DuckDB COPY 的目标路径不能使用 prepared parameter；路径先做 SQL literal 转义。
+        connection.execute(copy_sql, [resolved, *parameters])
+        parquet_glob = str(data_directory / "**" / "*.parquet")
+        rows, watch_events, repositories, minimum_day, maximum_day = connection.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(event_count), 0), COUNT(DISTINCT repo_id),
+                   MIN(event_day), MAX(event_day)
+            FROM read_parquet(?, hive_partitioning=true)
+            """,
+            [parquet_glob],
+        ).fetchone()
+        generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        files = sorted(data_directory.rglob("*.parquet"))
+        manifest = {
+            "schema_version": 1,
+            "kind": "history_silver",
+            "dataset_id": dataset_id,
+            "source_watermark": watermark,
+            "created_at": generated_at,
+            "input_files": len(resolved),
+            "repositories": int(repositories),
+            "event_days": int(rows),
+            "watch_events": int(watch_events),
+            "minimum_event_day": int(minimum_day) if minimum_day is not None else None,
+            "maximum_event_day": int(maximum_day) if maximum_day is not None else None,
+            "files": [
+                {
+                    "path": str(path.relative_to(staging)),
+                    "bytes": path.stat().st_size,
+                    "sha256": _sha256(path),
+                }
+                for path in files
+            ],
+        }
+        (staging / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(staging, final)
+        return final
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def _sha256(path: Path) -> str:
