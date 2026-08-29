@@ -9,6 +9,7 @@ from pathlib import Path
 
 import duckdb
 
+import starcat_history_builder.build as builder_module
 from starcat_history_builder.build import DuckDBOptions, build_delta, build_silver, build_snapshot
 
 
@@ -98,3 +99,46 @@ def test_silver_can_rebuild_snapshot(tmp_path: Path) -> None:
     )
     snapshot_manifest = json.loads((snapshot_zip.parent / "manifest.json").read_text())
     assert snapshot_manifest["watch_events"] == 4
+
+
+def test_silver_ignores_appledouble_parquet_sidecars(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "watch.parquet"
+    _parquet(source)
+    options = DuckDBOptions(temp_directory=tmp_path / "spill", memory_limit="1GB", threads=1)
+    real_connect = builder_module._connect
+    silver_output = tmp_path / "silver-out"
+
+    class AppleDoubleInjectingConnection:
+        """在 COPY 完成后模拟 macOS 向 exFAT 写入的 AppleDouble 伴生文件。"""
+
+        def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+            self.connection = connection
+
+        def execute(self, sql: str, parameters=None):
+            result = (
+                self.connection.execute(sql, parameters)
+                if parameters is not None
+                else self.connection.execute(sql)
+            )
+            if "FORMAT PARQUET" in sql and "PARTITION_BY" in sql:
+                generated = list(silver_output.rglob("part_*.parquet"))
+                assert generated
+                for parquet in generated:
+                    # AppleDouble 使用相同扩展名但不是 Parquet；宽泛 glob 不能把它交给 DuckDB。
+                    parquet.with_name(f"._{parquet.name}").write_bytes(b"\x00\x05\x16\x07AppleDouble")
+            return result
+
+        def close(self) -> None:
+            self.connection.close()
+
+    monkeypatch.setattr(
+        builder_module,
+        "_connect",
+        lambda configured_options: AppleDoubleInjectingConnection(real_connect(configured_options)),
+    )
+
+    silver = build_silver([str(source)], silver_output, "silver-v1", "2026-08-25", options)
+    manifest = json.loads((silver / "manifest.json").read_text())
+
+    assert manifest["watch_events"] == 4
+    assert all(not file["path"].split("/")[-1].startswith("._") for file in manifest["files"])

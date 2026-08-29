@@ -358,17 +358,19 @@ def build_silver(
         """
         # DuckDB COPY 的目标路径不能使用 prepared parameter；路径先做 SQL literal 转义。
         connection.execute(copy_sql, [resolved, *parameters])
-        parquet_glob = str(data_directory / "**" / "*.parquet")
+        # COPY 的文件名契约固定为 part_{uuid}.parquet。必须先在 Python 侧按此前缀收窄，
+        # 因为 macOS 向 exFAT 写扩展属性时会生成同扩展名的 ._part_* AppleDouble 文件；
+        # DuckDB 不会忽略 glob 中的伪 Parquet，而是会因缺少 PAR1 footer 终止整次构建。
+        files = sorted(data_directory.rglob("part_*.parquet"))
         rows, watch_events, repositories, minimum_day, maximum_day = connection.execute(
             """
             SELECT COUNT(*), COALESCE(SUM(event_count), 0), COUNT(DISTINCT repo_id),
                    MIN(event_day), MAX(event_day)
             FROM read_parquet(?, hive_partitioning=true)
             """,
-            [parquet_glob],
+            [[str(path) for path in files]],
         ).fetchone()
         generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        files = sorted(data_directory.rglob("*.parquet"))
         manifest = {
             "schema_version": 1,
             "kind": "history_silver",
