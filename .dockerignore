@@ -1,0 +1,9 @@
+.git
+.env
+data
+dist
+bin
+builder/.venv
+builder/.pytest_cache
+builder/**/__pycache__
+

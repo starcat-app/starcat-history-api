@@ -1,0 +1,203 @@
+# starcat-history-api
+
+Starcat 的公开 GitHub 仓库 Star 历史数据管道与后端 API。项目包含两部分：
+
+- 本地 Builder：读取 GH Archive WatchEvent Parquet，生成日级 Silver、完整 Snapshot 和每日 Delta。
+- 云端 API：接收经过校验的 Snapshot/Delta，通过 GitHub 当前 `stargazers_count` 校准历史曲线并向 Starcat 或第三方提供 REST API。
+
+原始 WatchEvent 始终保留在本地数据盘；云端只保存 `repo_id + 日事件数` 的压缩序列，不保存用户身份、actor、payload 或私有仓库数据。
+
+## 数据流
+
+```text
+GH Archive WatchEvent Raw Parquet
+  -> History Silver (repo_id + event_day + event_count)
+  -> Snapshot / Daily Delta ZIP
+  -> starcat-history-api Registry
+  -> GET /api/v1/repos/{owner}/{repo}/star-history
+  -> Starcat 项目洞察
+```
+
+WatchEvent 不可靠表达 Unstar，因此服务返回的是估算曲线：
+
+```text
+estimatedStars(day) = round(currentStars * cumulativeEvents(day) / totalEvents)
+```
+
+所有公共点固定标记为 `source=gh_archive`、`precision=estimated`，最后一个覆盖点等于 GitHub 当前 Star 数。
+
+## 环境要求
+
+- Go 1.25+
+- Python 3.11+ 与 [uv](https://docs.astral.sh/uv/)
+- Builder 临时目录必须位于有足够空间的数据盘；全量任务不要使用系统盘默认临时目录
+
+## 运行测试
+
+```bash
+make test
+```
+
+分别执行：
+
+```bash
+go test ./...
+go vet ./...
+cd builder
+uv sync --extra test --python 3.12
+uv run pytest -q
+```
+
+## 本地启动 API
+
+```bash
+cp .env.example .env
+# 编辑 .env，至少设置 API_KEYS 和 PUBLISH_KEYS
+make run
+```
+
+默认监听 `http://127.0.0.1:5014`。
+
+```bash
+curl -fsS http://127.0.0.1:5014/healthz
+
+curl -fsS \
+  -H 'Authorization: Bearer local-history-client-key' \
+  http://127.0.0.1:5014/api/v1/ping
+```
+
+## 构建 History Silver
+
+下面示例直接读取已经下载的 Raw WatchEvent 分区：
+
+```bash
+cd builder
+
+uv run starcat-history-builder silver \
+  --input '/Volumes/T0/Starcat/bigquery/watch-events-2016-2026/raw/gh_archive/watch-events-*.parquet' \
+  --output-dir /Volumes/T0/Starcat/history/silver \
+  --temp-dir /Volumes/T0/Starcat/history/tmp \
+  --dataset-id watch-silver-2016-20260825-v1 \
+  --watermark 2026-08-25 \
+  --memory-limit 12GB \
+  --threads 6
+```
+
+Silver 按 `event_year` 分区，manifest 记录输入文件数、仓库数、repo-day 数、WatchEvent 总数以及每个 Parquet 文件的 SHA-256。
+
+## 构建 Snapshot
+
+Snapshot 可以读取 Raw、Trainer Canonical 或 History Silver。生产建议从 Silver 重建：
+
+```bash
+cd builder
+
+uv run starcat-history-builder snapshot \
+  --input '/Volumes/T0/Starcat/history/silver/watch-silver-2016-20260825-v1/data/**/*.parquet' \
+  --output-dir /Volumes/T0/Starcat/history/snapshots \
+  --temp-dir /Volumes/T0/Starcat/history/tmp \
+  --model-version watch-history-20260825-v1 \
+  --watermark 2026-08-25 \
+  --memory-limit 12GB \
+  --threads 6
+```
+
+联调时可重复传 `--repo-id` 构建定向小快照。全量生产构建不要传该参数。
+
+产物目录包含：
+
+```text
+watch-history-20260825-v1/
+├── history.sqlite
+├── manifest.json
+├── checksums.json
+└── watch-history-20260825-v1.zip
+```
+
+## 构建每日 Delta
+
+Delta 是 `(from_watermark, to_watermark]` 的相邻 UTC 日增量，服务端会拒绝日期缺口：
+
+```bash
+cd builder
+
+uv run starcat-history-builder delta \
+  --input /Volumes/T0/Starcat/bigquery/watch-events-2016-2026/raw/gh_archive/watch-events-20260826.parquet \
+  --output-dir /Volumes/T0/Starcat/history/deltas \
+  --temp-dir /Volumes/T0/Starcat/history/tmp \
+  --delta-id watch-delta-20260826-v1 \
+  --from-watermark 2026-08-25 \
+  --to-watermark 2026-08-26 \
+  --memory-limit 4GB \
+  --threads 4
+```
+
+## 发布 Snapshot 与 Delta
+
+独立服务不需要网关头：
+
+```bash
+export HISTORY_API_BASE_URL=http://127.0.0.1:5014
+export HISTORY_PUBLISH_KEY=local-history-publish-key
+
+scripts/publish-bundle.sh snapshot \
+  watch-history-20260825-v1 \
+  /Volumes/T0/Starcat/history/snapshots/watch-history-20260825-v1/watch-history-20260825-v1.zip \
+  true
+
+scripts/publish-bundle.sh delta \
+  watch-delta-20260826-v1 \
+  /Volumes/T0/Starcat/history/deltas/watch-delta-20260826-v1/watch-delta-20260826-v1.zip
+```
+
+通过聚合 `starcat-api` 发布时再设置：
+
+```bash
+export HISTORY_API_BASE_URL=http://127.0.0.1:8080
+export HISTORY_GATEWAY_SERVICE=history
+```
+
+同一 Snapshot/Delta ID 和相同 checksum 可安全重放；同 ID 不同内容返回 `409`。
+
+## 查询 Star 历史
+
+```bash
+curl -fsS \
+  -H 'Authorization: Bearer local-history-client-key' \
+  -H 'X-SC-Svc: history' \
+  'http://127.0.0.1:8080/api/v1/repos/vinta/awesome-python/star-history?repo_id=21289110&range=all' \
+  | jq .
+```
+
+支持 `range=3m|1y|all`、`ETag` / `If-None-Match`。Private/Internal 仓库不提供公共数据。
+
+## 接口
+
+| 方法 | 路径 | 鉴权 | 用途 |
+|---|---|---|---|
+| GET | `/healthz` | 无 | 进程健康检查 |
+| GET | `/api/v1/ping` | `API_KEYS` | 客户端连接检查 |
+| GET | `/api/v1/repos/{owner}/{repo}/star-history` | `API_KEYS` | 查询公开仓库曲线 |
+| GET | `/internal/stats` | `API_KEYS` | Serving 规模与水位 |
+| GET | `/internal/metrics/*` | `API_KEYS` | 调用统计 |
+| POST | `/internal/v1/history-snapshots/{version}?activate=true` | `PUBLISH_KEYS` | 安装/激活快照 |
+| POST | `/internal/v1/history-snapshots/{version}/activate` | `PUBLISH_KEYS` | 回切已安装快照 |
+| POST | `/internal/v1/history-deltas/{delta_id}` | `PUBLISH_KEYS` | 幂等应用日增量 |
+| GET | `/internal/v1/history-active` | `PUBLISH_KEYS` | 当前版本和水位 |
+
+## 安全边界
+
+- 公共查询 Key 与内部发布 Key 必须分离。
+- ZIP 只接受规定文件白名单，校验 SHA-256、manifest、SQLite schema 和 `PRAGMA quick_check`。
+- Snapshot 激活使用版本目录和原子 active pointer；失败不会切换当前查询版本。
+- 服务不连接 BigQuery，也不读取家庭数据盘；它只消费本地平台主动发布的 Serving 产物。
+- GitHub Token 只用于读取公开仓库当前 metadata；未配置时受 GitHub 匿名限额约束。
+
+## 聚合部署
+
+生产环境作为 `starcat-api` 的第七个模块运行，通过 `X-SC-Svc: history` 分流；无需新增独立 Fly App。独立二进制与 Dockerfile仍保留，方便本地验证和第三方自托管。
+
+## License
+
+[MIT](./LICENSE)
+
