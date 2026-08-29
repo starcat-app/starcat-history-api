@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -26,6 +27,33 @@ var (
 type DayCount struct {
 	Day   int
 	Count uint64
+}
+
+// Merge 把按日增量合并进已有序列。相同日期累加，输出始终按日期严格递增。
+func Merge(existing, additions []DayCount) ([]DayCount, error) {
+	counts := make(map[int]uint64, len(existing)+len(additions))
+	for _, values := range [][]DayCount{existing, additions} {
+		for _, point := range values {
+			if point.Day < 0 || point.Count == 0 {
+				return nil, fmt.Errorf("%w: invalid merge point", ErrCorruptSeries)
+			}
+			current := counts[point.Day]
+			if ^uint64(0)-current < point.Count {
+				return nil, fmt.Errorf("%w: event count overflow", ErrCorruptSeries)
+			}
+			counts[point.Day] = current + point.Count
+		}
+	}
+	days := make([]int, 0, len(counts))
+	for day := range counts {
+		days = append(days, day)
+	}
+	sort.Ints(days)
+	result := make([]DayCount, 0, len(days))
+	for _, day := range days {
+		result = append(result, DayCount{Day: day, Count: counts[day]})
+	}
+	return result, nil
 }
 
 // DayFromTime 把时间归一为稳定的 UTC 日期编号。

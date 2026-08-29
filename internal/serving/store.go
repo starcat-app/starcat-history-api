@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/starcat-app/starcat-history-api/internal/series"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -53,6 +55,13 @@ type Stats struct {
 	MetadataEntries int64       `json:"metadata_entries"`
 	DatabaseBytes   int64       `json:"database_bytes"`
 	Active          ActiveState `json:"active"`
+}
+
+// DeltaRow 是本地 Builder 生成的 repo/day 增量。
+type DeltaRow struct {
+	RepoID     int64
+	EventDay   int
+	EventCount uint64
 }
 
 // Store 封装单个 Serving SQLite。快照切换由 Registry 在进程外层串行完成。
@@ -266,6 +275,19 @@ func (s *Store) SetActive(ctx context.Context, state ActiveState) error {
 	return err
 }
 
+// AppliedDelta 返回已应用增量的内容校验和，用于在水位检查前识别安全重放。
+func (s *Store) AppliedDelta(ctx context.Context, deltaID string) (string, bool, error) {
+	var checksum string
+	err := s.db.QueryRowContext(ctx, `SELECT checksum FROM applied_deltas WHERE delta_id = ?`, deltaID).Scan(&checksum)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return checksum, true, nil
+}
+
 // OperationalStats 返回控制台展示所需的小结果集，不扫描 BLOB 内容。
 func (s *Store) OperationalStats(ctx context.Context) (Stats, error) {
 	var result Stats
@@ -290,4 +312,107 @@ func (s *Store) OperationalStats(ctx context.Context) (Stats, error) {
 		result.DatabaseBytes = info.Size()
 	}
 	return result, nil
+}
+
+// ApplyDelta 在单个事务内合并增量、登记幂等键并推进 active watermark。
+// delta_id 相同且 checksum 相同视为重放成功；内容不同则拒绝覆盖。
+func (s *Store) ApplyDelta(ctx context.Context, deltaID, watermark, checksum string, rows []DeltaRow) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var existingChecksum string
+	err = tx.QueryRowContext(ctx, `SELECT checksum FROM applied_deltas WHERE delta_id = ?`, deltaID).Scan(&existingChecksum)
+	if err == nil {
+		if existingChecksum != checksum {
+			return false, fmt.Errorf("delta id already exists with different checksum")
+		}
+		return false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+
+	grouped := make(map[int64][]series.DayCount)
+	for _, row := range rows {
+		if row.RepoID <= 0 || row.EventDay < 0 || row.EventCount == 0 {
+			return false, fmt.Errorf("invalid delta row")
+		}
+		grouped[row.RepoID] = append(grouped[row.RepoID], series.DayCount{Day: row.EventDay, Count: row.EventCount})
+	}
+	for repoID, additions := range grouped {
+		var current RepositorySeries
+		var eventTotal int64
+		err := tx.QueryRowContext(ctx, `
+			SELECT repo_id, coverage_start_day, coverage_end_day, event_total, point_count,
+			       encoding, series, source_watermark, series_checksum
+			FROM repo_history_series WHERE repo_id = ?`, repoID).Scan(
+			&current.RepoID, &current.CoverageStartDay, &current.CoverageEndDay, &eventTotal,
+			&current.PointCount, &current.Encoding, &current.Series, &current.SourceWatermark,
+			&current.SeriesChecksum,
+		)
+		var existing []series.DayCount
+		if errors.Is(err, sql.ErrNoRows) {
+			current.RepoID = repoID
+			current.Encoding = series.Encoding
+		} else if err != nil {
+			return false, err
+		} else {
+			existing, err = series.Decode(current.Encoding, current.Series, current.SeriesChecksum, current.PointCount)
+			if err != nil {
+				return false, err
+			}
+		}
+		merged, err := series.Merge(existing, additions)
+		if err != nil {
+			return false, err
+		}
+		payload, seriesChecksum, err := series.Encode(merged)
+		if err != nil {
+			return false, err
+		}
+		var total uint64
+		for _, point := range merged {
+			total += point.Count
+		}
+		if total > uint64(^uint64(0)>>1) {
+			return false, fmt.Errorf("event total overflow")
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO repo_history_series (
+				repo_id, coverage_start_day, coverage_end_day, event_total, point_count,
+				encoding, series, source_watermark, series_checksum
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(repo_id) DO UPDATE SET
+				coverage_start_day=excluded.coverage_start_day,
+				coverage_end_day=excluded.coverage_end_day,
+				event_total=excluded.event_total,
+				point_count=excluded.point_count,
+				encoding=excluded.encoding,
+				series=excluded.series,
+				source_watermark=excluded.source_watermark,
+				series_checksum=excluded.series_checksum`,
+			repoID, merged[0].Day, merged[len(merged)-1].Day, int64(total), len(merged),
+			series.Encoding, payload, watermark, seriesChecksum,
+		)
+		if err != nil {
+			return false, err
+		}
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO applied_deltas (delta_id, watermark, checksum, applied_at) VALUES (?, ?, ?, ?)`,
+		deltaID, watermark, checksum, now.Format(time.RFC3339Nano)); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE history_active SET active_watermark = ?, generated_at = ? WHERE id = 1`,
+		watermark, now.Format(time.RFC3339Nano)); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }

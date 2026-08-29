@@ -32,3 +32,23 @@ func TestStoreRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected metadata: %#v %v %v", gotMetadata, ok, err)
 	}
 }
+
+func TestApplyDeltaIsIdempotent(t *testing.T) {
+	store, err := Open(t.TempDir() + "/history.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.SetActive(ctx, ActiveState{ModelVersion: "v1", ActiveWatermark: "2026-08-24", GeneratedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := store.ApplyDelta(ctx, "2026-08-25", "2026-08-25", "abc", []DeltaRow{{RepoID: 1, EventDay: 20_000, EventCount: 2}})
+	if err != nil || !applied {
+		t.Fatalf("first apply failed: %v %v", applied, err)
+	}
+	applied, err = store.ApplyDelta(ctx, "2026-08-25", "2026-08-25", "abc", []DeltaRow{{RepoID: 1, EventDay: 20_000, EventCount: 2}})
+	if err != nil || applied {
+		t.Fatalf("replay should be a no-op: %v %v", applied, err)
+	}
+}

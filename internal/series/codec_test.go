@@ -31,3 +31,22 @@ func TestDecodeRejectsChecksumMismatch(t *testing.T) {
 		t.Fatalf("expected ErrCorruptSeries, got %v", err)
 	}
 }
+
+func TestMergeAccumulatesSameDay(t *testing.T) {
+	merged, err := Merge(
+		[]DayCount{{Day: 10, Count: 2}, {Day: 12, Count: 1}},
+		[]DayCount{{Day: 11, Count: 4}, {Day: 12, Count: 3}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []DayCount{{Day: 10, Count: 2}, {Day: 11, Count: 4}, {Day: 12, Count: 4}}
+	if len(merged) != len(want) {
+		t.Fatalf("unexpected merged points: %#v", merged)
+	}
+	for index := range want {
+		if merged[index] != want[index] {
+			t.Fatalf("unexpected point %d: %#v", index, merged[index])
+		}
+	}
+}

@@ -3,6 +3,7 @@ module github.com/starcat-app/starcat-history-api
 go 1.25.0
 
 require (
+	github.com/joho/godotenv v1.5.1
 	github.com/starcat-app/starcat-api-kit v0.3.0
 	modernc.org/sqlite v1.52.0
 )
