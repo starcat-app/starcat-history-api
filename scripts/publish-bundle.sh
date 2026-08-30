@@ -54,9 +54,10 @@ case "$kind" in
     ;;
 esac
 
+# --data-binary 会让部分 curl 版本尝试把 GiB 级文件整体映射进内存；
+# --upload-file 对普通文件发送 Content-Length 并流式读取，服务端仍按 POST 处理。
 curl --fail --silent --show-error \
   --request POST \
   "${headers[@]}" \
-  --data-binary "@${bundle}" \
+  --upload-file "${bundle}" \
   "$target"
-
