@@ -131,6 +131,13 @@ func (s *Store) initialize(ctx context.Context) error {
 			active_watermark TEXT NOT NULL,
 			generated_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS history_statistics (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			repositories INTEGER NOT NULL,
+			event_days INTEGER NOT NULL,
+			watch_events INTEGER NOT NULL,
+			metadata_entries INTEGER NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS applied_deltas (
 			delta_id TEXT PRIMARY KEY,
 			watermark TEXT NOT NULL,
@@ -224,9 +231,25 @@ func (s *Store) Metadata(ctx context.Context, repoID int64) (RepositoryMetadata,
 	return result, true, nil
 }
 
-// SaveMetadata 原子更新 GitHub 元数据缓存。
+// SaveMetadata 原子更新 GitHub 元数据缓存，并只在首次插入时推进统计计数。
 func (s *Store) SaveMetadata(ctx context.Context, value RepositoryMetadata) error {
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO history_statistics (id, repositories, event_days, watch_events, metadata_entries)
+		VALUES (1, 0, 0, 0, 0) ON CONFLICT(id) DO NOTHING`); err != nil {
+		return err
+	}
+	var existing int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM repository_metadata WHERE repo_id = ?`, value.RepoID).Scan(&existing)
+	isNew := errors.Is(err, sql.ErrNoRows)
+	if err != nil && !isNew {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO repository_metadata (repo_id, full_name, visibility, current_stars, checked_at)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(repo_id) DO UPDATE SET
@@ -236,8 +259,15 @@ func (s *Store) SaveMetadata(ctx context.Context, value RepositoryMetadata) erro
 			checked_at=excluded.checked_at`,
 		value.RepoID, value.FullName, value.Visibility, value.CurrentStars,
 		value.CheckedAt.UTC().Format(time.RFC3339Nano),
-	)
-	return err
+	); err != nil {
+		return err
+	}
+	if isNew {
+		if _, err := tx.ExecContext(ctx, `UPDATE history_statistics SET metadata_entries = metadata_entries + 1 WHERE id = 1`); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // Active 返回当前数据版本；空库返回零值而不是错误，便于健康检查启动。
@@ -288,16 +318,25 @@ func (s *Store) AppliedDelta(ctx context.Context, deltaID string) (string, bool,
 	return checksum, true, nil
 }
 
-// OperationalStats 返回控制台展示所需的小结果集，不扫描 BLOB 内容。
+// EnsureStatistics 为旧 Snapshot 首次创建常量时间统计行；已经应用过 Delta 的计数不得覆盖。
+func (s *Store) EnsureStatistics(ctx context.Context, value Stats) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO history_statistics (id, repositories, event_days, watch_events, metadata_entries)
+		VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+		value.Repositories, value.EventDays, value.WatchEvents, value.MetadataEntries,
+	)
+	return err
+}
+
+// OperationalStats 返回控制台展示所需的常量时间统计，禁止在请求路径扫描全量序列表。
 func (s *Store) OperationalStats(ctx context.Context) (Stats, error) {
 	var result Stats
 	err := s.db.QueryRowContext(ctx, `
-		SELECT COUNT(*), COALESCE(SUM(point_count), 0), COALESCE(SUM(event_total), 0)
-		FROM repo_history_series`).Scan(&result.Repositories, &result.EventDays, &result.WatchEvents)
-	if err != nil {
-		return Stats{}, err
-	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_metadata`).Scan(&result.MetadataEntries); err != nil {
+		SELECT repositories, event_days, watch_events, metadata_entries
+		FROM history_statistics WHERE id = 1`).Scan(
+		&result.Repositories, &result.EventDays, &result.WatchEvents, &result.MetadataEntries,
+	)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return Stats{}, err
 	}
 	result.Active, err = s.Active(ctx)
@@ -333,6 +372,11 @@ func (s *Store) ApplyDelta(ctx context.Context, deltaID, watermark, checksum str
 	if !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO history_statistics (id, repositories, event_days, watch_events, metadata_entries)
+		VALUES (1, 0, 0, 0, 0) ON CONFLICT(id) DO NOTHING`); err != nil {
+		return false, err
+	}
 
 	grouped := make(map[int64][]series.DayCount)
 	for _, row := range rows {
@@ -341,6 +385,7 @@ func (s *Store) ApplyDelta(ctx context.Context, deltaID, watermark, checksum str
 		}
 		grouped[row.RepoID] = append(grouped[row.RepoID], series.DayCount{Day: row.EventDay, Count: row.EventCount})
 	}
+	var repositoryDelta, pointDelta, eventDelta int64
 	for repoID, additions := range grouped {
 		var current RepositorySeries
 		var eventTotal int64
@@ -353,7 +398,8 @@ func (s *Store) ApplyDelta(ctx context.Context, deltaID, watermark, checksum str
 			&current.SeriesChecksum,
 		)
 		var existing []series.DayCount
-		if errors.Is(err, sql.ErrNoRows) {
+		isNewRepository := errors.Is(err, sql.ErrNoRows)
+		if isNewRepository {
 			current.RepoID = repoID
 			current.Encoding = series.Encoding
 		} else if err != nil {
@@ -379,6 +425,11 @@ func (s *Store) ApplyDelta(ctx context.Context, deltaID, watermark, checksum str
 		if total > uint64(^uint64(0)>>1) {
 			return false, fmt.Errorf("event total overflow")
 		}
+		if isNewRepository {
+			repositoryDelta++
+		}
+		pointDelta += int64(len(merged) - len(existing))
+		eventDelta += int64(total) - eventTotal
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO repo_history_series (
 				repo_id, coverage_start_day, coverage_end_day, event_total, point_count,
@@ -409,6 +460,12 @@ func (s *Store) ApplyDelta(ctx context.Context, deltaID, watermark, checksum str
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE history_active SET active_watermark = ?, generated_at = ? WHERE id = 1`,
 		watermark, now.Format(time.RFC3339Nano)); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE history_statistics
+		SET repositories = repositories + ?, event_days = event_days + ?, watch_events = watch_events + ?
+		WHERE id = 1`, repositoryDelta, pointDelta, eventDelta); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {

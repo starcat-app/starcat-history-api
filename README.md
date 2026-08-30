@@ -278,7 +278,7 @@ curl -fsS \
 | GET | `/api/v1/ping` | `API_KEYS` | 客户端连接检查 |
 | GET | `/api/v1/repos/{owner}/{repo}/star-history` | `API_KEYS` | 查询公开仓库校准曲线（第三方） |
 | GET | `/api/v1/repos/{owner}/{repo}/star-history/events` | `API_KEYS` | 查询原始日事件（Starcat） |
-| GET | `/internal/stats` | `API_KEYS` | Serving 规模与水位 |
+| GET | `/internal/stats` | `API_KEYS` | 常量时间读取 Serving 规模与水位 |
 | GET | `/internal/metrics/*` | `API_KEYS` | 调用统计 |
 | POST | `/internal/v1/history-snapshots/{version}?activate=true` | `PUBLISH_KEYS` | 安装/激活快照 |
 | POST | `/internal/v1/history-snapshots/{version}/activate` | `PUBLISH_KEYS` | 回切已安装快照 |
@@ -291,6 +291,7 @@ curl -fsS \
 - ZIP 只接受规定文件白名单，并校验流式 SHA-256、manifest、SQLite schema 和激活水位。
 - Snapshot 的完整 `PRAGMA quick_check` 由正式 Builder 执行一次并写入 manifest v2；较小的 Delta 仍由发布端执行完整校验。
 - Snapshot 激活使用版本目录和原子 active pointer；失败不会切换当前查询版本。
+- 仓库数、repo-day 和 WatchEvent 总量由 Snapshot 固化、Delta 事务内递增；统计接口不会扫描全量序列表或占用查询连接。
 - 服务不连接 BigQuery，也不读取家庭数据盘；它只消费本地平台主动发布的 Serving 产物。
 - GitHub Token 只用于读取公开仓库当前 metadata；未配置时受 GitHub 匿名限额约束。
 

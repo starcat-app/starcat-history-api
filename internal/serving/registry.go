@@ -126,7 +126,8 @@ func NewRegistry(root, bootstrapStoreFile string, snapshotRetention int) (*Regis
 			return nil, fmt.Errorf("restore active history pointer: %w", ErrInvalidBundle)
 		}
 		directory := filepath.Join(registry.versions, pointer.ModelVersion)
-		if _, err := verifySnapshot(directory, pointer.ModelVersion); err != nil {
+		manifest, err := verifySnapshot(directory, pointer.ModelVersion)
+		if err != nil {
 			return nil, fmt.Errorf("restore active history snapshot: %w", err)
 		}
 		storeFile, err := registry.resolveRuntimeFile(pointer.StoreFile)
@@ -136,14 +137,20 @@ func NewRegistry(root, bootstrapStoreFile string, snapshotRetention int) (*Regis
 		var store *Store
 		if storeFile == "" {
 			// 兼容尚未写入 runtime 路径的预发布指针；迁移时复制而不是继续修改 Snapshot。
-			store, pointer.StoreFile, err = registry.prepareRuntime(pointer.ModelVersion)
+			store, pointer.StoreFile, err = registry.prepareRuntime(pointer.ModelVersion, manifest)
 			if err == nil {
 				err = registry.writeActivePointer(pointer)
 			}
 		} else {
 			store, err = Open(storeFile)
+			if err == nil {
+				err = store.EnsureStatistics(context.Background(), statsFromManifest(manifest))
+			}
 		}
 		if err != nil {
+			if store != nil {
+				store.Close()
+			}
 			return nil, err
 		}
 		state, err := store.Active(context.Background())
@@ -283,7 +290,7 @@ func (r *Registry) activateVerified(version string, manifest SnapshotManifest) e
 	if manifest.ModelVersion != version {
 		return fmt.Errorf("%w: snapshot version does not match manifest", ErrInvalidBundle)
 	}
-	newStore, runtimeFile, err := r.prepareRuntime(version)
+	newStore, runtimeFile, err := r.prepareRuntime(version, manifest)
 	if err != nil {
 		return err
 	}
@@ -317,7 +324,7 @@ func (r *Registry) activateVerified(version string, manifest SnapshotManifest) e
 }
 
 // prepareRuntime 从不可变 Snapshot 复制出独立可写库，Delta 永远不修改 Snapshot 本体。
-func (r *Registry) prepareRuntime(version string) (*Store, string, error) {
+func (r *Registry) prepareRuntime(version string, manifest SnapshotManifest) (*Store, string, error) {
 	source := filepath.Join(r.versions, version, snapshotDatabaseFile)
 	info, err := os.Stat(source)
 	if err != nil {
@@ -343,7 +350,20 @@ func (r *Registry) prepareRuntime(version string) (*Store, string, error) {
 		os.Remove(target)
 		return nil, "", err
 	}
+	if err := store.EnsureStatistics(context.Background(), statsFromManifest(manifest)); err != nil {
+		store.Close()
+		os.Remove(target)
+		return nil, "", err
+	}
 	return store, relative, nil
+}
+
+func statsFromManifest(manifest SnapshotManifest) Stats {
+	return Stats{
+		Repositories: manifest.Repositories,
+		EventDays:    manifest.EventDays,
+		WatchEvents:  manifest.WatchEvents,
+	}
 }
 
 func (r *Registry) writeActivePointer(pointer activePointer) error {
@@ -698,7 +718,11 @@ func verifySnapshot(directory, version string) (SnapshotManifest, error) {
 			return SnapshotManifest{}, fmt.Errorf("%w: invalid snapshot validation attestation", ErrInvalidBundle)
 		}
 	}
-	if err := verifySQLiteStructure(databasePath, []string{"repo_history_series", "repository_metadata", "history_active", "applied_deltas"}); err != nil {
+	requiredTables := []string{"repo_history_series", "repository_metadata", "history_active", "applied_deltas"}
+	if manifest.SchemaVersion == 2 {
+		requiredTables = append(requiredTables, "history_statistics")
+	}
+	if err := verifySQLiteStructure(databasePath, requiredTables); err != nil {
 		return SnapshotManifest{}, err
 	}
 	database, err := sql.Open("sqlite", "file:"+filepath.ToSlash(databasePath)+"?mode=ro")
@@ -706,6 +730,15 @@ func verifySnapshot(directory, version string) (SnapshotManifest, error) {
 		return SnapshotManifest{}, err
 	}
 	defer database.Close()
+	if manifest.SchemaVersion == 2 {
+		var repositories, eventDays, watchEvents int64
+		if err := database.QueryRow(`
+			SELECT repositories, event_days, watch_events FROM history_statistics WHERE id = 1`).Scan(
+			&repositories, &eventDays, &watchEvents,
+		); err != nil || repositories != manifest.Repositories || eventDays != manifest.EventDays || watchEvents != manifest.WatchEvents {
+			return SnapshotManifest{}, fmt.Errorf("%w: snapshot statistics do not match manifest", ErrInvalidBundle)
+		}
+	}
 	var activeVersion, activeWatermark string
 	if err := database.QueryRow(`SELECT model_version, active_watermark FROM history_active WHERE id = 1`).Scan(&activeVersion, &activeWatermark); err != nil || activeVersion != manifest.ModelVersion || activeWatermark != manifest.SourceWatermark {
 		return SnapshotManifest{}, fmt.Errorf("%w: snapshot active state does not match manifest", ErrInvalidBundle)

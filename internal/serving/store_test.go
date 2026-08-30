@@ -24,12 +24,23 @@ func TestStoreRoundTrip(t *testing.T) {
 	if got.SourceWatermark != value.SourceWatermark || got.EventTotal != 3 {
 		t.Fatalf("unexpected series: %#v", got)
 	}
+	if err := store.EnsureStatistics(ctx, Stats{Repositories: 1, EventDays: 2, WatchEvents: 3}); err != nil {
+		t.Fatal(err)
+	}
 	metadata := RepositoryMetadata{RepoID: 1, FullName: "owner/repo", Visibility: "public", CurrentStars: 42, CheckedAt: time.Now().UTC()}
 	if err := store.SaveMetadata(ctx, metadata); err != nil {
 		t.Fatal(err)
 	}
 	if gotMetadata, ok, err := store.Metadata(ctx, 1); err != nil || !ok || gotMetadata.FullName != metadata.FullName {
 		t.Fatalf("unexpected metadata: %#v %v %v", gotMetadata, ok, err)
+	}
+	metadata.CurrentStars = 43
+	if err := store.SaveMetadata(ctx, metadata); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := store.OperationalStats(ctx)
+	if err != nil || stats.Repositories != 1 || stats.EventDays != 2 || stats.WatchEvents != 3 || stats.MetadataEntries != 1 {
+		t.Fatalf("unexpected constant-time statistics: %#v %v", stats, err)
 	}
 }
 
@@ -50,5 +61,9 @@ func TestApplyDeltaIsIdempotent(t *testing.T) {
 	applied, err = store.ApplyDelta(ctx, "2026-08-25", "2026-08-25", "abc", []DeltaRow{{RepoID: 1, EventDay: 20_000, EventCount: 2}})
 	if err != nil || applied {
 		t.Fatalf("replay should be a no-op: %v %v", applied, err)
+	}
+	stats, err := store.OperationalStats(ctx)
+	if err != nil || stats.Repositories != 1 || stats.EventDays != 1 || stats.WatchEvents != 2 {
+		t.Fatalf("delta statistics must be idempotent: %#v %v", stats, err)
 	}
 }

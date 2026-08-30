@@ -230,6 +230,15 @@ def build_snapshot(
             "INSERT INTO history_active (id, model_version, active_watermark, generated_at) VALUES (1, ?, ?, ?)",
             (model_version, watermark, generated_at),
         )
+        # Serving 的统计接口必须是常量时间查询，不能在数千万仓库上临时 COUNT/SUM。
+        database.execute(
+            """
+            INSERT INTO history_statistics (
+                id, repositories, event_days, watch_events, metadata_entries
+            ) VALUES (1, ?, ?, ?, 0)
+            """,
+            (repository_count, point_count, watch_event_count),
+        )
         database.commit()
         if database.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise RuntimeError("Snapshot SQLite quick_check 未通过")

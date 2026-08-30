@@ -43,6 +43,9 @@ func TestRegistryInstallsSnapshotAndAppliesDelta(t *testing.T) {
 	if err := store.SetActive(ctx, ActiveState{ModelVersion: "watch-v1", ActiveWatermark: "2026-08-24", GeneratedAt: createdAt}); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.EnsureStatistics(ctx, Stats{Repositories: 1, EventDays: 1, WatchEvents: 2}); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -113,6 +116,13 @@ func TestRegistryInstallsSnapshotAndAppliesDelta(t *testing.T) {
 	if len(decoded) != 2 || decoded[1].Count != 3 {
 		t.Fatalf("unexpected merged series: %#v", decoded)
 	}
+	stats, err := registry.OperationalStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Repositories != 1 || stats.EventDays != 2 || stats.WatchEvents != 5 {
+		t.Fatalf("unexpected delta statistics: %#v", stats)
+	}
 	afterDeltaChecksum, err := fileChecksum(immutableSnapshot)
 	if err != nil || afterDeltaChecksum != immutableChecksum {
 		t.Fatalf("delta must not mutate immutable snapshot: %s %s %v", immutableChecksum, afterDeltaChecksum, err)
@@ -128,6 +138,10 @@ func TestRegistryInstallsSnapshotAndAppliesDelta(t *testing.T) {
 	restoredSeries, err := restored.Series(ctx, 7)
 	if err != nil || restoredSeries.EventTotal != 5 {
 		t.Fatalf("restart must restore delta-applied runtime: %#v %v", restoredSeries, err)
+	}
+	restoredStats, err := restored.OperationalStats(ctx)
+	if err != nil || restoredStats.Repositories != 1 || restoredStats.EventDays != 2 || restoredStats.WatchEvents != 5 {
+		t.Fatalf("restart must restore constant-time statistics: %#v %v", restoredStats, err)
 	}
 }
 

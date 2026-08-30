@@ -81,6 +81,9 @@ def test_build_snapshot_and_delta(tmp_path: Path) -> None:
     assert manifest["validation"]["database_bytes"] == (snapshot_dir / "history.sqlite").stat().st_size
     with sqlite3.connect(snapshot_dir / "history.sqlite") as database:
         assert database.execute("SELECT point_count, event_total FROM repo_history_series WHERE repo_id=7").fetchone() == (2, 3)
+        assert database.execute(
+            "SELECT repositories, event_days, watch_events, metadata_entries FROM history_statistics"
+        ).fetchone() == (2, 3, 4, 0)
         assert database.execute("PRAGMA quick_check").fetchone()[0] == "ok"
     with zipfile.ZipFile(snapshot_zip) as archive:
         assert sorted(archive.namelist()) == ["checksums.json", "history.sqlite", "manifest.json"]

@@ -25,6 +25,13 @@ CREATE TABLE history_active (
     active_watermark TEXT NOT NULL,
     generated_at TEXT NOT NULL
 );
+CREATE TABLE history_statistics (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    repositories INTEGER NOT NULL,
+    event_days INTEGER NOT NULL,
+    watch_events INTEGER NOT NULL,
+    metadata_entries INTEGER NOT NULL
+);
 CREATE TABLE applied_deltas (
     delta_id TEXT PRIMARY KEY,
     watermark TEXT NOT NULL,
@@ -41,4 +48,3 @@ CREATE TABLE repo_star_daily_delta (
     PRIMARY KEY (repo_id, event_day)
 );
 """
-
