@@ -11,7 +11,8 @@ import duckdb
 
 import starcat_history_builder.build as builder_module
 from starcat_history_builder.build import DuckDBOptions, build_delta, build_silver, build_snapshot
-from starcat_history_builder.daily import DailyOptions, run_daily
+import starcat_history_builder.daily as daily_module
+from starcat_history_builder.daily import DailyOptions, HTTPHistoryPublisher, run_daily
 
 
 def _parquet(path: Path) -> None:
@@ -206,3 +207,52 @@ def test_daily_pipeline_is_publishable_and_replay_safe(tmp_path: Path) -> None:
     replay = run_daily(daily, publisher)
     assert replay["status"] == "already_applied"
     assert publisher.uploads == 1
+
+
+def test_http_history_publisher_sends_aggregate_service_header(monkeypatch) -> None:
+    captured_headers: dict[str, str] = {}
+
+    class FakeResponse:
+        status = 200
+
+        @staticmethod
+        def read() -> bytes:
+            return b'{"active_watermark":"2026-08-25"}'
+
+    class FakeConnection:
+        def __init__(self, host: str, port: int | None, timeout: int) -> None:
+            assert host == "history.test"
+            assert port is None
+            assert timeout == 10
+
+        @staticmethod
+        def putrequest(method: str, path: str) -> None:
+            assert method == "GET"
+            assert path == "/internal/v1/history-active"
+
+        @staticmethod
+        def putheader(name: str, value: str) -> None:
+            captured_headers[name] = value
+
+        @staticmethod
+        def endheaders() -> None:
+            return None
+
+        @staticmethod
+        def getresponse() -> FakeResponse:
+            return FakeResponse()
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    monkeypatch.setattr(daily_module.http.client, "HTTPSConnection", FakeConnection)
+    publisher = HTTPHistoryPublisher(
+        "https://history.test",
+        "test-key",
+        timeout_seconds=10,
+        gateway_service="history",
+    )
+
+    assert publisher.active()["active_watermark"] == "2026-08-25"
+    assert captured_headers["X-SC-Svc"] == "history"

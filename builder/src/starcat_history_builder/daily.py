@@ -31,10 +31,17 @@ class HistoryPublisher(Protocol):
 class HTTPHistoryPublisher:
     """使用流式 HTTP 上传 Delta，避免把压缩包整体读入内存。"""
 
-    def __init__(self, base_url: str, token: str, timeout_seconds: int = 600) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        timeout_seconds: int = 600,
+        gateway_service: str = "",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout_seconds = timeout_seconds
+        self.gateway_service = gateway_service.strip()
 
     def active(self) -> dict[str, Any]:
         return self._request_json("GET", "/internal/v1/history-active")
@@ -59,6 +66,9 @@ class HTTPHistoryPublisher:
             connection.putrequest(method, path)
             connection.putheader("Authorization", f"Bearer {self.token}")
             connection.putheader("Accept", "application/json")
+            if self.gateway_service:
+                # 聚合 starcat-api 的业务路径彼此冲突，必须用短请求头明确分流。
+                connection.putheader("X-SC-Svc", self.gateway_service)
             if archive is not None:
                 connection.putheader("Content-Type", "application/zip")
                 connection.putheader("Content-Length", str(archive.stat().st_size))

@@ -27,6 +27,7 @@ exec uv run starcat-history-builder daily \
   --temp-dir "${history_root}/spill" \
   --target-watermark "${target_date}" \
   --base-url "${base_url}" \
+  --gateway-service "${HISTORY_GATEWAY_SERVICE:-}" \
   --publish-key-env HISTORY_PUBLISH_KEY \
   --memory-limit "${HISTORY_MEMORY_LIMIT:-12GB}" \
   --threads "${HISTORY_THREADS:-4}"

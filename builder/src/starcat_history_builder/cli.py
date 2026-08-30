@@ -42,6 +42,7 @@ def parser() -> argparse.ArgumentParser:
     daily.add_argument("--target-watermark", required=True, help="YYYY-MM-DD，必须与服务端水位相邻")
     daily.add_argument("--base-url", required=True, help="History 服务地址，可包含聚合服务的 /history 前缀")
     daily.add_argument("--publish-key-env", default="HISTORY_PUBLISH_KEY")
+    daily.add_argument("--gateway-service", default="", help="聚合网关 X-SC-Svc 值")
     daily.add_argument("--timeout-seconds", type=int, default=600)
     return root
 
@@ -61,7 +62,12 @@ def main() -> None:
             raise RuntimeError(f"环境变量 {args.publish_key_env} 未配置")
         output = run_daily(
             DailyOptions(args.input, args.silver_dir, args.output_dir, args.target_watermark, options),
-            HTTPHistoryPublisher(args.base_url, token, args.timeout_seconds),
+            HTTPHistoryPublisher(
+                args.base_url,
+                token,
+                args.timeout_seconds,
+                gateway_service=args.gateway_service,
+            ),
         )
     print(json.dumps(output, ensure_ascii=False, indent=2) if isinstance(output, dict) else output)
 

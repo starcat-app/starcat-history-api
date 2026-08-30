@@ -207,7 +207,9 @@ scripts/run-daily-pipeline.sh 2026-08-26
 - DuckDB spill：`/Volumes/T0/Starcat/history/spill`
 
 可分别通过 `HISTORY_RAW_ROOT`、`HISTORY_DATA_ROOT`、`HISTORY_MEMORY_LIMIT` 和
-`HISTORY_THREADS` 覆盖。通过聚合服务发布时，`HISTORY_BASE_URL` 应包含 History 路由前缀。
+`HISTORY_THREADS` 覆盖。通过聚合服务发布时设置
+`HISTORY_BASE_URL=https://starcat-api.fly.dev` 与 `HISTORY_GATEWAY_SERVICE=history`；独立服务
+不设置 gateway service。
 Raw 文件必须只包含目标 UTC 日期；已有 Silver/Delta 的来源摘要不一致时任务会拒绝覆盖，
 需要人工确认错误产物，而不是静默复用。
 
