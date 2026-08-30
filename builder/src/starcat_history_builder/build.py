@@ -47,6 +47,21 @@ def _resolve_inputs(patterns: list[str]) -> list[str]:
     return unique
 
 
+def input_checksum(patterns: list[str]) -> str:
+    """计算输入集合的稳定内容摘要，供增量任务审计与安全重放。"""
+    digest = hashlib.sha256()
+    for path in _resolve_inputs(patterns):
+        # 只纳入内容摘要，不写入机器相关的绝对路径，保证产物可在不同机器间核验。
+        digest.update(_sha256(Path(path)).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def file_checksum(path: Path) -> str:
+    """返回单个文件的 SHA-256，供产物完整性校验复用。"""
+    return _sha256(path)
+
+
 def _connect(options: DuckDBOptions) -> duckdb.DuckDBPyConnection:
     options.temp_directory.mkdir(parents=True, exist_ok=True)
     connection = duckdb.connect()
@@ -252,6 +267,7 @@ def build_delta(
 ) -> Path:
     """构建一个相邻水位的 repo/day Delta。"""
     resolved = _resolve_inputs(inputs)
+    source_checksum = input_checksum(resolved)
     staging, final = _prepare_destination(output_dir, delta_id)
     connection: duckdb.DuckDBPyConnection | None = None
     database: sqlite3.Connection | None = None
@@ -288,6 +304,7 @@ def build_delta(
             "to_watermark": to_watermark,
             "created_at": generated_at,
             "rows": row_count,
+            "source_checksum": source_checksum,
         }
         _finish_bundle(staging, final, manifest, "history-delta.sqlite", f"{delta_id}.zip")
         return final / f"{delta_id}.zip"
@@ -325,6 +342,7 @@ def build_silver(
 ) -> Path:
     """把 Raw/Canonical 聚合为按年份分区的 repo/day Silver Parquet Dataset。"""
     resolved = _resolve_inputs(inputs)
+    source_checksum = input_checksum(resolved)
     staging, final = _prepare_destination(output_dir, dataset_id)
     connection: duckdb.DuckDBPyConnection | None = None
     try:
@@ -378,6 +396,7 @@ def build_silver(
             "source_watermark": watermark,
             "created_at": generated_at,
             "input_files": len(resolved),
+            "input_checksum": source_checksum,
             "repositories": int(repositories),
             "event_days": int(rows),
             "watch_events": int(watch_events),

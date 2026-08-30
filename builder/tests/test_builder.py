@@ -11,6 +11,7 @@ import duckdb
 
 import starcat_history_builder.build as builder_module
 from starcat_history_builder.build import DuckDBOptions, build_delta, build_silver, build_snapshot
+from starcat_history_builder.daily import DailyOptions, run_daily
 
 
 def _parquet(path: Path) -> None:
@@ -48,6 +49,22 @@ def _canonical_parquet(path: Path) -> None:
     connection.close()
 
 
+def _daily_parquet(path: Path) -> None:
+    connection = duckdb.connect()
+    connection.execute(
+        """
+        COPY (
+            SELECT * FROM (VALUES
+                ('c', 'u3', 7::BIGINT, TIMESTAMPTZ '2026-08-25 01:00:00+00'),
+                ('d', 'u4', 8::BIGINT, TIMESTAMPTZ '2026-08-25 02:00:00+00')
+            ) AS events(source_record_id, actor_id, repo_id, created_at)
+        ) TO ? (FORMAT PARQUET)
+        """,
+        [str(path)],
+    )
+    connection.close()
+
+
 def test_build_snapshot_and_delta(tmp_path: Path) -> None:
     source = tmp_path / "watch.parquet"
     _parquet(source)
@@ -66,6 +83,8 @@ def test_build_snapshot_and_delta(tmp_path: Path) -> None:
         assert sorted(archive.namelist()) == ["checksums.json", "history.sqlite", "manifest.json"]
 
     delta_zip = build_delta([str(source)], tmp_path / "delta-out", "delta-1", "2026-08-24", "2026-08-25", options)
+    delta_manifest = json.loads((delta_zip.parent / "manifest.json").read_text())
+    assert len(delta_manifest["source_checksum"]) == 64
     with sqlite3.connect(delta_zip.parent / "history-delta.sqlite") as database:
         assert database.execute("SELECT COUNT(*) FROM repo_star_daily_delta").fetchone()[0] == 2
 
@@ -142,3 +161,42 @@ def test_silver_ignores_appledouble_parquet_sidecars(tmp_path: Path, monkeypatch
 
     assert manifest["watch_events"] == 4
     assert all(not file["path"].split("/")[-1].startswith("._") for file in manifest["files"])
+
+
+def test_daily_pipeline_is_publishable_and_replay_safe(tmp_path: Path) -> None:
+    source = tmp_path / "watch.parquet"
+    _daily_parquet(source)
+    options = DuckDBOptions(temp_directory=tmp_path / "spill", memory_limit="1GB", threads=1)
+
+    class FakePublisher:
+        """模拟服务端水位；重跑时由服务端事实直接判定已完成。"""
+
+        def __init__(self) -> None:
+            self.watermark = "2026-08-24"
+            self.uploads = 0
+
+        def active(self) -> dict[str, str]:
+            return {"model_version": "fixture-v1", "active_watermark": self.watermark}
+
+        def publish_delta(self, delta_id: str, archive: Path) -> dict[str, object]:
+            assert delta_id == "watch-delta-20260825-v1"
+            assert archive.is_file()
+            with zipfile.ZipFile(archive) as bundle:
+                manifest = json.loads(bundle.read("manifest.json"))
+            assert manifest["source_checksum"]
+            self.uploads += 1
+            self.watermark = "2026-08-25"
+            return {"delta_id": delta_id, "active_watermark": self.watermark, "applied": True}
+
+    publisher = FakePublisher()
+    daily = DailyOptions(
+        [str(source)], tmp_path / "silver", tmp_path / "deltas", "2026-08-25", options
+    )
+    result = run_daily(daily, publisher)
+    assert result["status"] == "published"
+    assert publisher.uploads == 1
+    assert (tmp_path / "deltas" / "watch-delta-20260825-v1" / "publish-receipt.json").is_file()
+
+    replay = run_daily(daily, publisher)
+    assert replay["status"] == "already_applied"
+    assert publisher.uploads == 1

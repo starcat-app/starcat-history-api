@@ -183,6 +183,29 @@ uv run starcat-history-builder delta \
   --threads 4
 ```
 
+生产日常任务使用完整闭环脚本。它不会访问 BigQuery，只消费本地数据平台已经下载完成的
+单日 Raw 分区；随后依次校验服务端水位、构建不可变 Silver、生成相邻 Delta、流式上传并
+写入 `publish-receipt.json`。服务端水位已到达目标日期时会直接返回成功，因此任务可安全重跑：
+
+```bash
+export HISTORY_PUBLISH_KEY=local-history-publish-key
+export HISTORY_BASE_URL=http://127.0.0.1:5014
+
+scripts/run-daily-pipeline.sh 2026-08-26
+```
+
+默认目录：
+
+- Raw：`/Volumes/T0/Starcat/bigquery/watch-events-2016-2026/raw/gh_archive`
+- Silver：`/Volumes/T0/Starcat/history/silver/daily`
+- Delta：`/Volumes/T0/Starcat/history/deltas`
+- DuckDB spill：`/Volumes/T0/Starcat/history/spill`
+
+可分别通过 `HISTORY_RAW_ROOT`、`HISTORY_DATA_ROOT`、`HISTORY_MEMORY_LIMIT` 和
+`HISTORY_THREADS` 覆盖。通过聚合服务发布时，`HISTORY_BASE_URL` 应包含 History 路由前缀。
+Raw 文件必须只包含目标 UTC 日期；已有 Silver/Delta 的来源摘要不一致时任务会拒绝覆盖，
+需要人工确认错误产物，而不是静默复用。
+
 ## 发布 Snapshot 与 Delta
 
 独立服务不需要网关头：
@@ -268,4 +291,3 @@ curl -fsS \
 ## License
 
 [MIT](./LICENSE)
-
