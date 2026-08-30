@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,7 +78,7 @@ func TestRegistryInstallsSnapshotAndAppliesDelta(t *testing.T) {
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
-	deltaManifest := DeltaManifest{SchemaVersion: 1, Kind: "history_delta", DeltaID: "delta-20260825", FromWatermark: "2026-08-24", ToWatermark: "2026-08-25", CreatedAt: createdAt, Rows: 1}
+	deltaManifest := DeltaManifest{SchemaVersion: 1, Kind: "history_delta", DeltaID: "delta-20260825", FromWatermark: "2026-08-24", ToWatermark: "2026-08-25", CreatedAt: createdAt, Rows: 1, SourceChecksum: strings.Repeat("a", 64)}
 	deltaZip := buildTestBundle(t, deltaDirectory, snapshotManifestFile, deltaManifest, deltaDatabaseFile)
 	if _, applied, err := registry.InstallDeltaZip(ctx, "delta-20260825", bytes.NewReader(deltaZip), 16<<20); err != nil || !applied {
 		t.Fatalf("apply delta failed: %v %v", applied, err)

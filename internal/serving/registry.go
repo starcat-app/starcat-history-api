@@ -33,6 +33,7 @@ var (
 	ErrVersionConflict   = errors.New("history version already exists with different content")
 	ErrWatermarkConflict = errors.New("history watermark conflict")
 	identifierPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	checksumPattern      = regexp.MustCompile(`^[a-f0-9]{64}$`)
 )
 
 // SnapshotManifest 是本地 Builder 和云端服务之间的快照契约。
@@ -49,13 +50,14 @@ type SnapshotManifest struct {
 
 // DeltaManifest 描述相邻水位之间的一次日增量。
 type DeltaManifest struct {
-	SchemaVersion int       `json:"schema_version"`
-	Kind          string    `json:"kind"`
-	DeltaID       string    `json:"delta_id"`
-	FromWatermark string    `json:"from_watermark"`
-	ToWatermark   string    `json:"to_watermark"`
-	CreatedAt     time.Time `json:"created_at"`
-	Rows          int64     `json:"rows"`
+	SchemaVersion  int       `json:"schema_version"`
+	Kind           string    `json:"kind"`
+	DeltaID        string    `json:"delta_id"`
+	FromWatermark  string    `json:"from_watermark"`
+	ToWatermark    string    `json:"to_watermark"`
+	CreatedAt      time.Time `json:"created_at"`
+	Rows           int64     `json:"rows"`
+	SourceChecksum string    `json:"source_checksum"`
 }
 
 type activePointer struct {
@@ -452,7 +454,7 @@ func verifyDelta(directory, deltaID string) (DeltaManifest, []DeltaRow, error) {
 		return DeltaManifest{}, nil, err
 	}
 	var manifest DeltaManifest
-	if err := json.Unmarshal(payload, &manifest); err != nil || manifest.SchemaVersion != 1 || manifest.Kind != "history_delta" || manifest.DeltaID != deltaID || manifest.FromWatermark == "" || manifest.ToWatermark == "" || manifest.CreatedAt.IsZero() {
+	if err := json.Unmarshal(payload, &manifest); err != nil || manifest.SchemaVersion != 1 || manifest.Kind != "history_delta" || manifest.DeltaID != deltaID || manifest.FromWatermark == "" || manifest.ToWatermark == "" || manifest.CreatedAt.IsZero() || !checksumPattern.MatchString(manifest.SourceChecksum) {
 		return DeltaManifest{}, nil, fmt.Errorf("%w: invalid delta manifest", ErrInvalidBundle)
 	}
 	fromDate, fromErr := time.Parse("2006-01-02", manifest.FromWatermark)
