@@ -6,6 +6,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -47,12 +49,17 @@ func TestRegistryInstallsSnapshotAndAppliesDelta(t *testing.T) {
 	snapshotManifest := SnapshotManifest{SchemaVersion: 1, Kind: "history_snapshot", ModelVersion: "watch-v1", SourceWatermark: "2026-08-24", CreatedAt: createdAt, Repositories: 1, EventDays: 1, WatchEvents: 2}
 	snapshotZip := buildTestBundle(t, snapshotDirectory, snapshotManifestFile, snapshotManifest, snapshotDatabaseFile)
 
-	registry, err := NewRegistry(filepath.Join(workspace, "registry"), filepath.Join(workspace, "bootstrap.sqlite"))
+	registry, err := NewRegistry(filepath.Join(workspace, "registry"), filepath.Join(workspace, "bootstrap.sqlite"), 3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer registry.Close()
 	if _, err := registry.InstallSnapshotZip(ctx, "watch-v1", bytes.NewReader(snapshotZip), true, 16<<20); err != nil {
+		t.Fatal(err)
+	}
+	immutableSnapshot := filepath.Join(workspace, "registry", "versions", "watch-v1", snapshotDatabaseFile)
+	immutableChecksum, err := fileChecksum(immutableSnapshot)
+	if err != nil {
 		t.Fatal(err)
 	}
 	active, err := registry.Active(ctx)
@@ -96,6 +103,111 @@ func TestRegistryInstallsSnapshotAndAppliesDelta(t *testing.T) {
 	}
 	if len(decoded) != 2 || decoded[1].Count != 3 {
 		t.Fatalf("unexpected merged series: %#v", decoded)
+	}
+	afterDeltaChecksum, err := fileChecksum(immutableSnapshot)
+	if err != nil || afterDeltaChecksum != immutableChecksum {
+		t.Fatalf("delta must not mutate immutable snapshot: %s %s %v", immutableChecksum, afterDeltaChecksum, err)
+	}
+	if err := registry.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := NewRegistry(filepath.Join(workspace, "registry"), filepath.Join(workspace, "bootstrap.sqlite"), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	restoredSeries, err := restored.Series(ctx, 7)
+	if err != nil || restoredSeries.EventTotal != 5 {
+		t.Fatalf("restart must restore delta-applied runtime: %#v %v", restoredSeries, err)
+	}
+}
+
+func TestRegistryRetainsRollbackSnapshotAndPrunesCoveredDeltas(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	registryRoot := filepath.Join(workspace, "registry")
+	registry, err := NewRegistry(registryRoot, filepath.Join(workspace, "bootstrap.sqlite"), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+
+	for index := 1; index <= 4; index++ {
+		version := fmt.Sprintf("watch-v%d", index)
+		watermark := fmt.Sprintf("2026-08-%02d", 20+index)
+		bundle := snapshotBundle(t, workspace, version, watermark, time.Date(2026, 8, 20+index, 0, 0, 0, 0, time.UTC))
+		if _, err := registry.InstallSnapshotZip(ctx, version, bytes.NewReader(bundle), true, 16<<20); err != nil {
+			t.Fatal(err)
+		}
+		if index == 1 {
+			writeDeltaManifest(t, filepath.Join(registryRoot, "deltas", "covered"), "covered", "2026-08-21")
+			writeDeltaManifest(t, filepath.Join(registryRoot, "deltas", "future"), "future", "2026-08-30")
+		}
+	}
+
+	versions, err := os.ReadDir(filepath.Join(registryRoot, "versions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range versions {
+		if entry.IsDir() {
+			names = append(names, entry.Name())
+		}
+	}
+	if strings.Join(names, ",") != "watch-v3,watch-v4" {
+		t.Fatalf("unexpected retained versions: %v", names)
+	}
+	if _, err := os.Stat(filepath.Join(registryRoot, "deltas", "covered")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("covered delta should be removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(registryRoot, "deltas", "future")); err != nil {
+		t.Fatalf("future delta should remain: %v", err)
+	}
+	if err := registry.ActivateSnapshot("watch-v3"); err != nil {
+		t.Fatalf("retained previous snapshot should support rollback: %v", err)
+	}
+}
+
+func snapshotBundle(t *testing.T, workspace, version, watermark string, createdAt time.Time) []byte {
+	t.Helper()
+	directory := filepath.Join(workspace, version+"-source")
+	if err := os.Mkdir(directory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(filepath.Join(directory, snapshotDatabaseFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetActive(context.Background(), ActiveState{ModelVersion: version, ActiveWatermark: watermark, GeneratedAt: createdAt}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifest := SnapshotManifest{
+		SchemaVersion: 1, Kind: "history_snapshot", ModelVersion: version,
+		SourceWatermark: watermark, CreatedAt: createdAt,
+	}
+	return buildTestBundle(t, directory, snapshotManifestFile, manifest, snapshotDatabaseFile)
+}
+
+func writeDeltaManifest(t *testing.T, directory, deltaID, toWatermark string) {
+	t.Helper()
+	if err := os.Mkdir(directory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	manifest := DeltaManifest{
+		SchemaVersion: 1, Kind: "history_delta", DeltaID: deltaID,
+		FromWatermark: "2026-08-20", ToWatermark: toWatermark,
+		CreatedAt: time.Now().UTC(), SourceChecksum: strings.Repeat("b", 64),
+	}
+	payload, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, snapshotManifestFile), payload, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

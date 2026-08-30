@@ -29,7 +29,8 @@ const (
 	defaultStoreFile   = "./data/history.sqlite"
 	// 全量 4000 万级仓库快照可能超过 2 GiB，默认上限保留到 16 GiB；
 	// 实际 Fly 卷容量与上传窗口仍由运维侧单独控制。
-	defaultMaxBundleBytes = int64(16 << 30)
+	defaultMaxBundleBytes    = int64(16 << 30)
+	defaultSnapshotRetention = 3
 )
 
 // Options 控制 History 服务装配。
@@ -45,6 +46,7 @@ type Options struct {
 	MetadataTTL            time.Duration
 	MaximumPoints          int
 	MaxBundleBytes         int64
+	SnapshotRetention      int
 	SkipListenLogEndpoints bool
 }
 
@@ -67,17 +69,18 @@ func FromEnv() (*Service, error) {
 		return nil, err
 	}
 	return New(Options{
-		Port:             kitenv.OrDefault("PORT", defaultPort),
-		APIKeys:          apiKeys,
-		PublishKeys:      optionalListEnv("PUBLISH_KEYS"),
-		GitHubToken:      strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
-		GitHubEndpoint:   kitenv.OrDefault("GITHUB_API_ENDPOINT", "https://api.github.com"),
-		StoreFile:        envOrDefault("STORE_FILE", defaultStoreFile),
-		RegistryDir:      envOrDefault("REGISTRY_DIR", defaultRegistryDir),
-		MetricsStoreFile: envOrDefault("METRICS_STORE_FILE", "./data/history-metrics.db"),
-		MetadataTTL:      kitenv.DurationSeconds("METADATA_TTL_SECONDS", 24*time.Hour),
-		MaximumPoints:    intEnv("MAXIMUM_HISTORY_POINTS", series.DefaultMaximumPoints),
-		MaxBundleBytes:   int64Env("MAX_BUNDLE_BYTES", defaultMaxBundleBytes),
+		Port:              kitenv.OrDefault("PORT", defaultPort),
+		APIKeys:           apiKeys,
+		PublishKeys:       optionalListEnv("PUBLISH_KEYS"),
+		GitHubToken:       strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
+		GitHubEndpoint:    kitenv.OrDefault("GITHUB_API_ENDPOINT", "https://api.github.com"),
+		StoreFile:         envOrDefault("STORE_FILE", defaultStoreFile),
+		RegistryDir:       envOrDefault("REGISTRY_DIR", defaultRegistryDir),
+		MetricsStoreFile:  envOrDefault("METRICS_STORE_FILE", "./data/history-metrics.db"),
+		MetadataTTL:       kitenv.DurationSeconds("METADATA_TTL_SECONDS", 24*time.Hour),
+		MaximumPoints:     intEnv("MAXIMUM_HISTORY_POINTS", series.DefaultMaximumPoints),
+		MaxBundleBytes:    int64Env("MAX_BUNDLE_BYTES", defaultMaxBundleBytes),
+		SnapshotRetention: intEnv("SNAPSHOT_RETENTION", defaultSnapshotRetention),
 	})
 }
 
@@ -107,7 +110,10 @@ func New(opt Options) (*Service, error) {
 	if opt.MaxBundleBytes <= 0 {
 		opt.MaxBundleBytes = defaultMaxBundleBytes
 	}
-	registry, err := serving.NewRegistry(opt.RegistryDir, opt.StoreFile)
+	if opt.SnapshotRetention < 2 {
+		opt.SnapshotRetention = defaultSnapshotRetention
+	}
+	registry, err := serving.NewRegistry(opt.RegistryDir, opt.StoreFile, opt.SnapshotRetention)
 	if err != nil {
 		return nil, fmt.Errorf("initialize history registry: %w", err)
 	}

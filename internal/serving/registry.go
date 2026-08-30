@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -29,11 +31,17 @@ const (
 )
 
 var (
-	ErrInvalidBundle     = errors.New("invalid history bundle")
-	ErrVersionConflict   = errors.New("history version already exists with different content")
-	ErrWatermarkConflict = errors.New("history watermark conflict")
-	identifierPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
-	checksumPattern      = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	ErrInvalidBundle       = errors.New("invalid history bundle")
+	ErrVersionConflict     = errors.New("history version already exists with different content")
+	ErrWatermarkConflict   = errors.New("history watermark conflict")
+	ErrInsufficientStorage = errors.New("insufficient history registry storage")
+	identifierPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	checksumPattern        = regexp.MustCompile(`^[a-f0-9]{64}$`)
+)
+
+const (
+	installExpansionFactor  = int64(4)
+	installFreeReserveBytes = int64(1 << 30)
 )
 
 // SnapshotManifest 是本地 Builder 和云端服务之间的快照契约。
@@ -62,6 +70,7 @@ type DeltaManifest struct {
 
 type activePointer struct {
 	ModelVersion string `json:"model_version"`
+	StoreFile    string `json:"store_file,omitempty"`
 }
 
 // Registry 持有当前 Store，并负责快照的原子切换和增量串行应用。
@@ -70,14 +79,17 @@ type Registry struct {
 	root       string
 	versions   string
 	deltas     string
+	runtime    string
 	activeFile string
 	publishMu  sync.Mutex
 	mu         sync.RWMutex
 	store      *Store
+	// snapshotRetention 至少保留当前与上一个版本，保证激活失败或数据回归时可快速回滚。
+	snapshotRetention int
 }
 
 // NewRegistry 恢复已激活快照；首次启动则使用 bootstrapStoreFile 创建空库。
-func NewRegistry(root, bootstrapStoreFile string) (*Registry, error) {
+func NewRegistry(root, bootstrapStoreFile string, snapshotRetention int) (*Registry, error) {
 	root = strings.TrimSpace(root)
 	if root == "" {
 		return nil, fmt.Errorf("history registry directory is required")
@@ -86,11 +98,16 @@ func NewRegistry(root, bootstrapStoreFile string) (*Registry, error) {
 	if err != nil {
 		return nil, err
 	}
+	if snapshotRetention < 2 {
+		snapshotRetention = 2
+	}
 	registry := &Registry{
 		root: absolute, versions: filepath.Join(absolute, "versions"),
-		deltas: filepath.Join(absolute, "deltas"), activeFile: filepath.Join(absolute, "active.json"),
+		deltas: filepath.Join(absolute, "deltas"), runtime: filepath.Join(absolute, "runtime"),
+		activeFile:        filepath.Join(absolute, "active.json"),
+		snapshotRetention: snapshotRetention,
 	}
-	for _, directory := range []string{registry.versions, registry.deltas} {
+	for _, directory := range []string{registry.versions, registry.deltas, registry.runtime} {
 		if err := os.MkdirAll(directory, 0o750); err != nil {
 			return nil, err
 		}
@@ -104,11 +121,30 @@ func NewRegistry(root, bootstrapStoreFile string) (*Registry, error) {
 		if _, err := verifySnapshot(directory, pointer.ModelVersion); err != nil {
 			return nil, fmt.Errorf("restore active history snapshot: %w", err)
 		}
-		store, err := Open(filepath.Join(directory, snapshotDatabaseFile))
+		storeFile, err := registry.resolveRuntimeFile(pointer.StoreFile)
 		if err != nil {
 			return nil, err
 		}
+		var store *Store
+		if storeFile == "" {
+			// 兼容尚未写入 runtime 路径的预发布指针；迁移时复制而不是继续修改 Snapshot。
+			store, pointer.StoreFile, err = registry.prepareRuntime(pointer.ModelVersion)
+			if err == nil {
+				err = registry.writeActivePointer(pointer)
+			}
+		} else {
+			store, err = Open(storeFile)
+		}
+		if err != nil {
+			return nil, err
+		}
+		state, err := store.Active(context.Background())
+		if err != nil || state.ModelVersion != pointer.ModelVersion {
+			store.Close()
+			return nil, fmt.Errorf("restore active history runtime: %w", ErrInvalidBundle)
+		}
 		registry.store = store
+		registry.cleanupRuntimes(pointer.StoreFile)
 		return registry, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -162,6 +198,30 @@ func (r *Registry) OperationalStats(ctx context.Context) (Stats, error) {
 	return r.store.OperationalStats(ctx)
 }
 
+// EnsureInstallCapacity 在读取大包前预留解压、runtime 副本和安全余量，避免上传到一半占满卷。
+func (r *Registry) EnsureInstallCapacity(uploadBytes int64) error {
+	if uploadBytes <= 0 {
+		return nil
+	}
+	if uploadBytes > (int64(^uint64(0)>>1)-installFreeReserveBytes)/installExpansionFactor {
+		return fmt.Errorf("%w: upload size overflow", ErrInsufficientStorage)
+	}
+	required := uploadBytes*installExpansionFactor + installFreeReserveBytes
+	return r.ensureAvailable(required)
+}
+
+func (r *Registry) ensureAvailable(required int64) error {
+	var status syscall.Statfs_t
+	if err := syscall.Statfs(r.root, &status); err != nil {
+		return err
+	}
+	available := int64(status.Bavail) * int64(status.Bsize)
+	if available < required {
+		return fmt.Errorf("%w: available=%d required=%d", ErrInsufficientStorage, available, required)
+	}
+	return nil
+}
+
 // InstallSnapshotZip 校验并不可变安装快照，activate=true 时原子切换查询 Store。
 func (r *Registry) InstallSnapshotZip(ctx context.Context, version string, reader io.Reader, activate bool, maximumBytes int64) (SnapshotManifest, error) {
 	r.publishMu.Lock()
@@ -209,27 +269,20 @@ func (r *Registry) activate(version string) error {
 	if _, err := verifySnapshot(directory, version); err != nil {
 		return err
 	}
-	newStore, err := Open(filepath.Join(directory, snapshotDatabaseFile))
+	newStore, runtimeFile, err := r.prepareRuntime(version)
 	if err != nil {
 		return err
 	}
 	state, err := newStore.Active(context.Background())
 	if err != nil || state.ModelVersion != version {
 		newStore.Close()
+		os.Remove(filepath.Join(r.root, runtimeFile))
 		return fmt.Errorf("%w: snapshot active state does not match manifest", ErrInvalidBundle)
 	}
-	payload, err := json.Marshal(activePointer{ModelVersion: version})
-	if err != nil {
+	previousVersion := r.currentPointerVersion()
+	if err := r.writeActivePointer(activePointer{ModelVersion: version, StoreFile: runtimeFile}); err != nil {
 		newStore.Close()
-		return err
-	}
-	temporary := r.activeFile + ".tmp"
-	if err := os.WriteFile(temporary, payload, 0o600); err != nil {
-		newStore.Close()
-		return err
-	}
-	if err := os.Rename(temporary, r.activeFile); err != nil {
-		newStore.Close()
+		os.Remove(filepath.Join(r.root, runtimeFile))
 		return err
 	}
 	r.mu.Lock()
@@ -237,7 +290,199 @@ func (r *Registry) activate(version string) error {
 	r.store = newStore
 	r.mu.Unlock()
 	if oldStore != nil {
-		return oldStore.Close()
+		if err := oldStore.Close(); err != nil {
+			log.Printf("close previous history runtime failed: %v", err)
+		}
+	}
+	r.cleanupRuntimes(runtimeFile)
+	// 清理失败不回滚已完成的原子切换，否则调用方会误以为激活失败并重复发布。
+	if err := r.cleanupArtifacts(version, previousVersion, state.ActiveWatermark); err != nil {
+		log.Printf("history registry cleanup failed after activating %s: %v", version, err)
+	}
+	return nil
+}
+
+// prepareRuntime 从不可变 Snapshot 复制出独立可写库，Delta 永远不修改 Snapshot 本体。
+func (r *Registry) prepareRuntime(version string) (*Store, string, error) {
+	source := filepath.Join(r.versions, version, snapshotDatabaseFile)
+	info, err := os.Stat(source)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := r.ensureAvailable(info.Size() + installFreeReserveBytes); err != nil {
+		return nil, "", err
+	}
+	name := fmt.Sprintf("%s-%d.sqlite", version, time.Now().UTC().UnixNano())
+	relative := filepath.Join("runtime", name)
+	target := filepath.Join(r.root, relative)
+	temporary := target + ".tmp"
+	if err := copyFile(source, temporary); err != nil {
+		os.Remove(temporary)
+		return nil, "", err
+	}
+	if err := os.Rename(temporary, target); err != nil {
+		os.Remove(temporary)
+		return nil, "", err
+	}
+	store, err := Open(target)
+	if err != nil {
+		os.Remove(target)
+		return nil, "", err
+	}
+	return store, relative, nil
+}
+
+func (r *Registry) writeActivePointer(pointer activePointer) error {
+	payload, err := json.Marshal(pointer)
+	if err != nil {
+		return err
+	}
+	temporary := r.activeFile + ".tmp"
+	if err := os.WriteFile(temporary, payload, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(temporary, r.activeFile)
+}
+
+func (r *Registry) resolveRuntimeFile(relative string) (string, error) {
+	if strings.TrimSpace(relative) == "" {
+		return "", nil
+	}
+	cleaned := filepath.Clean(relative)
+	if filepath.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("restore active history runtime: %w", ErrInvalidBundle)
+	}
+	absolute := filepath.Join(r.root, cleaned)
+	if filepath.Dir(absolute) != r.runtime {
+		return "", fmt.Errorf("restore active history runtime: %w", ErrInvalidBundle)
+	}
+	return absolute, nil
+}
+
+func (r *Registry) cleanupRuntimes(activeRelative string) {
+	active, err := r.resolveRuntimeFile(activeRelative)
+	if err != nil {
+		return
+	}
+	entries, err := os.ReadDir(r.runtime)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		path := filepath.Join(r.runtime, entry.Name())
+		if entry.IsDir() || path == active {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			log.Printf("remove stale history runtime %s failed: %v", path, err)
+		}
+	}
+}
+
+func copyFile(source, target string) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(output, input); err != nil {
+		output.Close()
+		return err
+	}
+	if err := output.Sync(); err != nil {
+		output.Close()
+		return err
+	}
+	return output.Close()
+}
+
+func (r *Registry) currentPointerVersion() string {
+	payload, err := os.ReadFile(r.activeFile)
+	if err != nil {
+		return ""
+	}
+	var pointer activePointer
+	if json.Unmarshal(payload, &pointer) != nil || !identifierPattern.MatchString(pointer.ModelVersion) {
+		return ""
+	}
+	return pointer.ModelVersion
+}
+
+// cleanupArtifacts 保留可回滚快照，并删除已被新快照水位覆盖的 Delta 包。
+func (r *Registry) cleanupArtifacts(activeVersion, previousVersion, activeWatermark string) error {
+	entries, err := os.ReadDir(r.versions)
+	if err != nil {
+		return err
+	}
+	type candidate struct {
+		version   string
+		createdAt time.Time
+	}
+	candidates := make([]candidate, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() || !identifierPattern.MatchString(entry.Name()) {
+			continue
+		}
+		payload, err := os.ReadFile(filepath.Join(r.versions, entry.Name(), snapshotManifestFile))
+		if err != nil {
+			continue
+		}
+		var manifest SnapshotManifest
+		if json.Unmarshal(payload, &manifest) != nil || manifest.ModelVersion != entry.Name() || manifest.CreatedAt.IsZero() {
+			continue
+		}
+		candidates = append(candidates, candidate{version: entry.Name(), createdAt: manifest.CreatedAt})
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].createdAt.After(candidates[j].createdAt) })
+	keep := map[string]struct{}{activeVersion: {}}
+	if previousVersion != "" {
+		keep[previousVersion] = struct{}{}
+	}
+	for _, item := range candidates {
+		if len(keep) >= r.snapshotRetention {
+			break
+		}
+		keep[item.version] = struct{}{}
+	}
+	for _, item := range candidates {
+		if _, retained := keep[item.version]; retained {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(r.versions, item.version)); err != nil {
+			return err
+		}
+	}
+
+	watermark, err := time.Parse("2006-01-02", activeWatermark)
+	if err != nil {
+		return err
+	}
+	deltas, err := os.ReadDir(r.deltas)
+	if err != nil {
+		return err
+	}
+	for _, entry := range deltas {
+		if !entry.IsDir() || !identifierPattern.MatchString(entry.Name()) {
+			continue
+		}
+		payload, err := os.ReadFile(filepath.Join(r.deltas, entry.Name(), snapshotManifestFile))
+		if err != nil {
+			continue
+		}
+		var manifest DeltaManifest
+		if json.Unmarshal(payload, &manifest) != nil {
+			continue
+		}
+		toWatermark, parseErr := time.Parse("2006-01-02", manifest.ToWatermark)
+		if parseErr == nil && !toWatermark.After(watermark) {
+			if err := os.RemoveAll(filepath.Join(r.deltas, entry.Name())); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -248,6 +493,11 @@ func (r *Registry) InstallDeltaZip(ctx context.Context, deltaID string, reader i
 	defer r.publishMu.Unlock()
 	if !identifierPattern.MatchString(deltaID) {
 		return DeltaManifest{}, false, fmt.Errorf("%w: invalid delta id", ErrInvalidBundle)
+	}
+	// bootstrap STORE_FILE 仅用于本地只读查询。只有 Registry 管理的 Snapshot 才有
+	// 独立 runtime 与可恢复指针，禁止 Delta 直接修改外部 bootstrap 文件。
+	if r.currentPointerVersion() == "" {
+		return DeltaManifest{}, false, fmt.Errorf("%w: no registry-managed snapshot is active", ErrWatermarkConflict)
 	}
 	staging, err := os.MkdirTemp(r.root, ".delta-staging-")
 	if err != nil {

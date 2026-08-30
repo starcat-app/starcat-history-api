@@ -29,6 +29,10 @@ func (h *PublishHandler) HandleSnapshotUpload(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "BAD_REQUEST", "activate must be true or false", nil)
 		return
 	}
+	if err := h.registry.EnsureInstallCapacity(r.ContentLength); err != nil {
+		writePublishError(w, err)
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, h.maximumBytes)
 	manifest, err := h.registry.InstallSnapshotZip(r.Context(), r.PathValue("model_version"), r.Body, activate, h.maximumBytes)
 	if err != nil {
@@ -53,6 +57,10 @@ func (h *PublishHandler) HandleSnapshotActivate(w http.ResponseWriter, r *http.R
 // HandleDeltaUpload 校验并幂等应用日增量。
 func (h *PublishHandler) HandleDeltaUpload(w http.ResponseWriter, r *http.Request) {
 	if !requireZip(w, r) {
+		return
+	}
+	if err := h.registry.EnsureInstallCapacity(r.ContentLength); err != nil {
+		writePublishError(w, err)
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, h.maximumBytes)
@@ -97,6 +105,8 @@ func writePublishError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "WATERMARK_CONFLICT", err.Error(), nil)
 	case errors.Is(err, serving.ErrInvalidBundle):
 		writeError(w, http.StatusUnprocessableEntity, "INVALID_BUNDLE", err.Error(), nil)
+	case errors.Is(err, serving.ErrInsufficientStorage):
+		writeError(w, http.StatusInsufficientStorage, "INSUFFICIENT_STORAGE", err.Error(), nil)
 	default:
 		writeError(w, http.StatusInternalServerError, "PUBLISH_FAILED", "History bundle publish failed.", nil)
 	}

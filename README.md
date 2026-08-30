@@ -232,6 +232,10 @@ export HISTORY_GATEWAY_SERVICE=history
 ```
 
 同一 Snapshot/Delta ID 和相同 checksum 可安全重放；同 ID 不同内容返回 `409`。
+激活新 Snapshot 后默认保留最近 3 个版本（最少 2 个，确保可回滚），并删除水位已被
+新 Snapshot 覆盖的 Delta 产物；可通过 `SNAPSHOT_RETENTION` 调整保留数。
+服务端还会根据上传包 `Content-Length` 预留解压、可写 runtime 副本和 1 GiB 安全余量；
+容量不足时在读取大包前返回 `507 INSUFFICIENT_STORAGE`。
 
 ## 查询 Star 历史
 
