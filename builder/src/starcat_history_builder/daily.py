@@ -85,6 +85,11 @@ class HTTPHistoryPublisher:
             decoded = json.loads(payload or b"{}")
             if not isinstance(decoded, dict):
                 raise RuntimeError("History 服务返回的 JSON 不是对象")
+            data = decoded.get("data")
+            if isinstance(data, dict):
+                # 聚合服务统一使用 {schema_version, data}；独立 History 服务测试替身
+                # 仍可返回扁平对象，两种部署方式在 Publisher 端收敛为同一契约。
+                return data
             return decoded
         finally:
             connection.close()

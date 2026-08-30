@@ -217,7 +217,7 @@ def test_http_history_publisher_sends_aggregate_service_header(monkeypatch) -> N
 
         @staticmethod
         def read() -> bytes:
-            return b'{"active_watermark":"2026-08-25"}'
+            return b'{"schema_version":1,"data":{"active_watermark":"2026-08-25"}}'
 
     class FakeConnection:
         def __init__(self, host: str, port: int | None, timeout: int) -> None:
