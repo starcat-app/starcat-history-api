@@ -292,6 +292,7 @@ curl -fsS \
 - 公共查询 Key 与内部发布 Key 必须分离。
 - ZIP 只接受规定文件白名单，并校验流式 SHA-256、manifest、SQLite schema 和激活水位。
 - Snapshot 的完整 `PRAGMA quick_check` 由正式 Builder 执行一次并写入 manifest v2；较小的 Delta 仍由发布端执行完整校验。
+- Snapshot ZIP 完成解压后立即关闭并删除；后续 checksum/schema/runtime 安装只保留解压文件，避免多版本切换时额外占用一份压缩包空间。
 - Snapshot 激活使用版本目录和原子 active pointer；失败不会切换当前查询版本。
 - 仓库数、repo-day 和 WatchEvent 总量由 Snapshot 固化、Delta 事务内递增；统计接口不会扫描全量序列表或占用查询连接。
 - 服务不连接 BigQuery，也不读取家庭数据盘；它只消费本地平台主动发布的 Serving 产物。
