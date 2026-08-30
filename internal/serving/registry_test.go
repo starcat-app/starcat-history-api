@@ -46,7 +46,16 @@ func TestRegistryInstallsSnapshotAndAppliesDelta(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	snapshotManifest := SnapshotManifest{SchemaVersion: 1, Kind: "history_snapshot", ModelVersion: "watch-v1", SourceWatermark: "2026-08-24", CreatedAt: createdAt, Repositories: 1, EventDays: 1, WatchEvents: 2}
+	databaseInfo, err := os.Stat(snapshotDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotManifest := SnapshotManifest{
+		SchemaVersion: 2, Kind: "history_snapshot", ModelVersion: "watch-v1",
+		SourceWatermark: "2026-08-24", CreatedAt: createdAt,
+		Repositories: 1, EventDays: 1, WatchEvents: 2,
+		Validation: &SnapshotValidation{SQLiteQuickCheck: "ok", DatabaseBytes: databaseInfo.Size()},
+	}
 	snapshotZip := buildTestBundle(t, snapshotDirectory, snapshotManifestFile, snapshotManifest, snapshotDatabaseFile)
 
 	registry, err := NewRegistry(filepath.Join(workspace, "registry"), filepath.Join(workspace, "bootstrap.sqlite"), 3)
@@ -119,6 +128,86 @@ func TestRegistryInstallsSnapshotAndAppliesDelta(t *testing.T) {
 	restoredSeries, err := restored.Series(ctx, 7)
 	if err != nil || restoredSeries.EventTotal != 5 {
 		t.Fatalf("restart must restore delta-applied runtime: %#v %v", restoredSeries, err)
+	}
+}
+
+func TestRegistryRejectsV2SnapshotWithoutBuilderValidation(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	directory := filepath.Join(workspace, "snapshot")
+	if err := os.Mkdir(directory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(filepath.Join(directory, snapshotDatabaseFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)
+	if err := store.SetActive(ctx, ActiveState{ModelVersion: "watch-v2", ActiveWatermark: "2026-08-25", GeneratedAt: createdAt}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifest := SnapshotManifest{
+		SchemaVersion: 2, Kind: "history_snapshot", ModelVersion: "watch-v2",
+		SourceWatermark: "2026-08-25", CreatedAt: createdAt,
+	}
+	bundle := buildTestBundle(t, directory, snapshotManifestFile, manifest, snapshotDatabaseFile)
+	registry, err := NewRegistry(filepath.Join(workspace, "registry"), filepath.Join(workspace, "bootstrap.sqlite"), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+	if _, err := registry.InstallSnapshotZip(ctx, "watch-v2", bytes.NewReader(bundle), false, 16<<20); !errors.Is(err, ErrInvalidBundle) {
+		t.Fatalf("v2 snapshot without Builder validation must be rejected: %v", err)
+	}
+}
+
+func TestRegistryRejectsSnapshotChecksumMismatch(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	directory := filepath.Join(workspace, "snapshot")
+	if err := os.Mkdir(directory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(filepath.Join(directory, snapshotDatabaseFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)
+	if err := store.SetActive(ctx, ActiveState{ModelVersion: "watch-v1", ActiveWatermark: "2026-08-25", GeneratedAt: createdAt}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifest := SnapshotManifest{SchemaVersion: 1, Kind: "history_snapshot", ModelVersion: "watch-v1", SourceWatermark: "2026-08-25", CreatedAt: createdAt}
+	manifestPayload, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, snapshotManifestFile), manifestPayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checksumsPayload, err := json.Marshal(map[string]string{
+		snapshotManifestFile: strings.Repeat("0", 64),
+		snapshotDatabaseFile: strings.Repeat("0", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, checksumsFile), checksumsPayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bundle := archiveTestBundle(t, directory, snapshotManifestFile, snapshotDatabaseFile)
+	registry, err := NewRegistry(filepath.Join(workspace, "registry"), filepath.Join(workspace, "bootstrap.sqlite"), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+	if _, err := registry.InstallSnapshotZip(ctx, "watch-v1", bytes.NewReader(bundle), false, 16<<20); !errors.Is(err, ErrInvalidBundle) {
+		t.Fatalf("snapshot with mismatched checksum must be rejected: %v", err)
 	}
 }
 
@@ -235,7 +324,11 @@ func buildTestBundle(t *testing.T, directory, manifestName string, manifest any,
 	if err := os.WriteFile(filepath.Join(directory, checksumsFile), checksumsPayload, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	return archiveTestBundle(t, directory, manifestName, databaseName)
+}
 
+func archiveTestBundle(t *testing.T, directory, manifestName, databaseName string) []byte {
+	t.Helper()
 	var output bytes.Buffer
 	archive := zip.NewWriter(&output)
 	names := []string{manifestName, checksumsFile, databaseName}

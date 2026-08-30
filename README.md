@@ -114,6 +114,11 @@ watch-history-20260825-v1/
 └── watch-history-20260825-v1.zip
 ```
 
+Snapshot manifest v2 会记录 Builder 已完成的 `PRAGMA quick_check` 结果和 SQLite
+字节数。发布端仍校验鉴权、ZIP 白名单、流式 SHA-256、必要表和激活水位，但不会再次
+完整扫描大数据库；上传后立即激活也会复用同一次校验结果。旧的 manifest v1 仍可
+用于已安装快照的恢复和回滚。
+
 ## 本地安装 Snapshot（推荐联调）
 
 本机只跑查询时，**只需 `history.sqlite`**，不必拷贝 `manifest.json` / `checksums.json` / `*.zip`，也不必拷 Silver / Raw Parquet。
@@ -283,7 +288,8 @@ curl -fsS \
 ## 安全边界
 
 - 公共查询 Key 与内部发布 Key 必须分离。
-- ZIP 只接受规定文件白名单，校验 SHA-256、manifest、SQLite schema 和 `PRAGMA quick_check`。
+- ZIP 只接受规定文件白名单，并校验流式 SHA-256、manifest、SQLite schema 和激活水位。
+- Snapshot 的完整 `PRAGMA quick_check` 由正式 Builder 执行一次并写入 manifest v2；较小的 Delta 仍由发布端执行完整校验。
 - Snapshot 激活使用版本目录和原子 active pointer；失败不会切换当前查询版本。
 - 服务不连接 BigQuery，也不读取家庭数据盘；它只消费本地平台主动发布的 Serving 产物。
 - GitHub Token 只用于读取公开仓库当前 metadata；未配置时受 GitHub 匿名限额约束。

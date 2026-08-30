@@ -235,8 +235,9 @@ def build_snapshot(
             raise RuntimeError("Snapshot SQLite quick_check 未通过")
         database.close()
         database = None
+        database_bytes = database_path.stat().st_size
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "history_snapshot",
             "model_version": model_version,
             "source_watermark": watermark,
@@ -244,6 +245,12 @@ def build_snapshot(
             "repositories": repository_count,
             "event_days": point_count,
             "watch_events": watch_event_count,
+            # 云端会继续校验 SHA-256、SQLite 表结构与激活水位；完整 quick_check
+            # 只在 Builder 执行一次，避免 GiB 级数据库在发布端被重复全盘扫描。
+            "validation": {
+                "sqlite_quick_check": "ok",
+                "database_bytes": database_bytes,
+            },
         }
         _finish_bundle(staging, final, manifest, "history.sqlite", f"{model_version}.zip")
         return final / f"{model_version}.zip"

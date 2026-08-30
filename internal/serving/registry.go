@@ -46,14 +46,22 @@ const (
 
 // SnapshotManifest 是本地 Builder 和云端服务之间的快照契约。
 type SnapshotManifest struct {
-	SchemaVersion   int       `json:"schema_version"`
-	Kind            string    `json:"kind"`
-	ModelVersion    string    `json:"model_version"`
-	SourceWatermark string    `json:"source_watermark"`
-	CreatedAt       time.Time `json:"created_at"`
-	Repositories    int64     `json:"repositories"`
-	EventDays       int64     `json:"event_days"`
-	WatchEvents     int64     `json:"watch_events"`
+	SchemaVersion   int                 `json:"schema_version"`
+	Kind            string              `json:"kind"`
+	ModelVersion    string              `json:"model_version"`
+	SourceWatermark string              `json:"source_watermark"`
+	CreatedAt       time.Time           `json:"created_at"`
+	Repositories    int64               `json:"repositories"`
+	EventDays       int64               `json:"event_days"`
+	WatchEvents     int64               `json:"watch_events"`
+	Validation      *SnapshotValidation `json:"validation,omitempty"`
+}
+
+// SnapshotValidation 证明正式 Builder 已经完成一次整库校验。
+// 发布服务仍会独立验证传输摘要和必要结构，但不重复扫描 GiB 级 SQLite 全部页面。
+type SnapshotValidation struct {
+	SQLiteQuickCheck string `json:"sqlite_quick_check"`
+	DatabaseBytes    int64  `json:"database_bytes"`
 }
 
 // DeltaManifest 描述相邻水位之间的一次日增量。
@@ -247,7 +255,9 @@ func (r *Registry) InstallSnapshotZip(ctx context.Context, version string, reade
 		return SnapshotManifest{}, err
 	}
 	if activate {
-		if err := r.activate(version); err != nil {
+		// manifest 对应的文件刚完成摘要和结构校验，立即激活时复用该结果，
+		// 避免对同一个大快照重复执行验证。
+		if err := r.activateVerified(version, manifest); err != nil {
 			return SnapshotManifest{}, err
 		}
 	}
@@ -261,13 +271,17 @@ func (r *Registry) ActivateSnapshot(version string) error {
 	if !identifierPattern.MatchString(version) {
 		return fmt.Errorf("%w: invalid model version", ErrInvalidBundle)
 	}
-	return r.activate(version)
+	directory := filepath.Join(r.versions, version)
+	manifest, err := verifySnapshot(directory, version)
+	if err != nil {
+		return err
+	}
+	return r.activateVerified(version, manifest)
 }
 
-func (r *Registry) activate(version string) error {
-	directory := filepath.Join(r.versions, version)
-	if _, err := verifySnapshot(directory, version); err != nil {
-		return err
+func (r *Registry) activateVerified(version string, manifest SnapshotManifest) error {
+	if manifest.ModelVersion != version {
+		return fmt.Errorf("%w: snapshot version does not match manifest", ErrInvalidBundle)
 	}
 	newStore, runtimeFile, err := r.prepareRuntime(version)
 	if err != nil {
@@ -579,6 +593,7 @@ func extractAndVerifyZip(reader io.Reader, staging string, maximumBytes int64, r
 	}
 	var unpacked int64
 	seen := make(map[string]bool, len(required))
+	actualChecksums := make(map[string]string, len(required))
 	for _, file := range zipReader.File {
 		name := filepath.ToSlash(file.Name)
 		if !wanted[name] || seen[name] || file.FileInfo().IsDir() || file.Mode()&os.ModeSymlink != 0 {
@@ -597,7 +612,9 @@ func extractAndVerifyZip(reader io.Reader, staging string, maximumBytes int64, r
 			source.Close()
 			return "", nil, err
 		}
-		_, copyErr := io.Copy(destination, source)
+		// 解压时同步计算摘要，避免文件落盘后再额外完整读取一次。
+		digest := sha256.New()
+		_, copyErr := io.Copy(io.MultiWriter(destination, digest), source)
 		sourceErr, destinationErr := source.Close(), destination.Close()
 		if copyErr != nil {
 			return "", nil, copyErr
@@ -609,6 +626,7 @@ func extractAndVerifyZip(reader io.Reader, staging string, maximumBytes int64, r
 			return "", nil, destinationErr
 		}
 		seen[name] = true
+		actualChecksums[name] = hex.EncodeToString(digest.Sum(nil))
 	}
 	if len(seen) != len(required) {
 		return "", nil, fmt.Errorf("%w: required files are missing", ErrInvalidBundle)
@@ -625,10 +643,7 @@ func extractAndVerifyZip(reader io.Reader, staging string, maximumBytes int64, r
 		if !ok {
 			return "", nil, fmt.Errorf("%w: checksum missing for %s", ErrInvalidBundle, name)
 		}
-		actual, err := fileChecksum(filepath.Join(extracted, name))
-		if err != nil {
-			return "", nil, err
-		}
+		actual := actualChecksums[name]
 		if actual != expected {
 			return "", nil, fmt.Errorf("%w: checksum mismatch for %s", ErrInvalidBundle, name)
 		}
@@ -673,24 +688,24 @@ func verifySnapshot(directory, version string) (SnapshotManifest, error) {
 		return SnapshotManifest{}, err
 	}
 	var manifest SnapshotManifest
-	if err := json.Unmarshal(payload, &manifest); err != nil || manifest.SchemaVersion != 1 || manifest.Kind != "history_snapshot" || manifest.ModelVersion != version || manifest.SourceWatermark == "" || manifest.CreatedAt.IsZero() {
+	if err := json.Unmarshal(payload, &manifest); err != nil || (manifest.SchemaVersion != 1 && manifest.SchemaVersion != 2) || manifest.Kind != "history_snapshot" || manifest.ModelVersion != version || manifest.SourceWatermark == "" || manifest.CreatedAt.IsZero() {
 		return SnapshotManifest{}, fmt.Errorf("%w: invalid snapshot manifest", ErrInvalidBundle)
 	}
-	if err := verifySQLite(filepath.Join(directory, snapshotDatabaseFile), []string{"repo_history_series", "repository_metadata", "history_active", "applied_deltas"}); err != nil {
+	databasePath := filepath.Join(directory, snapshotDatabaseFile)
+	if manifest.SchemaVersion == 2 {
+		info, statErr := os.Stat(databasePath)
+		if statErr != nil || manifest.Validation == nil || manifest.Validation.SQLiteQuickCheck != "ok" || manifest.Validation.DatabaseBytes <= 0 || info.Size() != manifest.Validation.DatabaseBytes {
+			return SnapshotManifest{}, fmt.Errorf("%w: invalid snapshot validation attestation", ErrInvalidBundle)
+		}
+	}
+	if err := verifySQLiteStructure(databasePath, []string{"repo_history_series", "repository_metadata", "history_active", "applied_deltas"}); err != nil {
 		return SnapshotManifest{}, err
 	}
-	database, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(directory, snapshotDatabaseFile))+"?mode=ro")
+	database, err := sql.Open("sqlite", "file:"+filepath.ToSlash(databasePath)+"?mode=ro")
 	if err != nil {
 		return SnapshotManifest{}, err
 	}
 	defer database.Close()
-	var repositories, eventDays, watchEvents int64
-	if err := database.QueryRow(`SELECT COUNT(*), COALESCE(SUM(point_count), 0), COALESCE(SUM(event_total), 0) FROM repo_history_series`).Scan(&repositories, &eventDays, &watchEvents); err != nil {
-		return SnapshotManifest{}, err
-	}
-	if repositories != manifest.Repositories || eventDays != manifest.EventDays || watchEvents != manifest.WatchEvents {
-		return SnapshotManifest{}, fmt.Errorf("%w: snapshot statistics do not match manifest", ErrInvalidBundle)
-	}
 	var activeVersion, activeWatermark string
 	if err := database.QueryRow(`SELECT model_version, active_watermark FROM history_active WHERE id = 1`).Scan(&activeVersion, &activeWatermark); err != nil || activeVersion != manifest.ModelVersion || activeWatermark != manifest.SourceWatermark {
 		return SnapshotManifest{}, fmt.Errorf("%w: snapshot active state does not match manifest", ErrInvalidBundle)
@@ -753,6 +768,9 @@ func verifyDelta(directory, deltaID string) (DeltaManifest, []DeltaRow, error) {
 }
 
 func verifySQLite(path string, requiredTables []string) error {
+	if err := verifySQLiteStructure(path, requiredTables); err != nil {
+		return err
+	}
 	database, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro")
 	if err != nil {
 		return err
@@ -762,6 +780,17 @@ func verifySQLite(path string, requiredTables []string) error {
 	if err := database.QueryRow(`PRAGMA quick_check`).Scan(&result); err != nil || result != "ok" {
 		return fmt.Errorf("%w: SQLite quick_check failed", ErrInvalidBundle)
 	}
+	return nil
+}
+
+// verifySQLiteStructure 只读取 SQLite 元数据。完整页面校验由 Builder 执行并写入
+// Snapshot attestation；Delta 较小，仍继续走 verifySQLite 的严格校验。
+func verifySQLiteStructure(path string, requiredTables []string) error {
+	database, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro")
+	if err != nil {
+		return err
+	}
+	defer database.Close()
 	for _, table := range requiredTables {
 		var found string
 		if err := database.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&found); err != nil {
