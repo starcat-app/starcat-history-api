@@ -145,6 +145,39 @@ func TestRegistryInstallsSnapshotAndAppliesDelta(t *testing.T) {
 	}
 }
 
+func TestExtractAndVerifyZipReleasesArchiveAfterExtraction(t *testing.T) {
+	workspace := t.TempDir()
+	source := filepath.Join(workspace, "source")
+	if err := os.Mkdir(source, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, snapshotDatabaseFile), []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := map[string]any{"schema_version": 1, "kind": "test"}
+	bundle := buildTestBundle(t, source, snapshotManifestFile, manifest, snapshotDatabaseFile)
+	staging := filepath.Join(workspace, "staging")
+	if err := os.Mkdir(staging, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	extracted, _, err := extractAndVerifyZip(
+		bytes.NewReader(bundle),
+		staging,
+		16<<20,
+		[]string{snapshotManifestFile, checksumsFile, snapshotDatabaseFile},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(staging, "bundle.zip")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("archive must be released after extraction: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(extracted, snapshotDatabaseFile)); err != nil {
+		t.Fatalf("extracted database must remain available: %v", err)
+	}
+}
+
 func TestRegistryRejectsV2SnapshotWithoutBuilderValidation(t *testing.T) {
 	ctx := context.Background()
 	workspace := t.TempDir()

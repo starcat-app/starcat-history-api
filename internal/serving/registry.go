@@ -602,7 +602,12 @@ func extractAndVerifyZip(reader io.Reader, staging string, maximumBytes int64, r
 	if err != nil {
 		return "", nil, fmt.Errorf("%w: open zip: %v", ErrInvalidBundle, err)
 	}
-	defer zipReader.Close()
+	zipReaderOpen := true
+	defer func() {
+		if zipReaderOpen {
+			_ = zipReader.Close()
+		}
+	}()
 	wanted := make(map[string]bool, len(required))
 	for _, name := range required {
 		wanted[name] = true
@@ -650,6 +655,15 @@ func extractAndVerifyZip(reader io.Reader, staging string, maximumBytes int64, r
 	}
 	if len(seen) != len(required) {
 		return "", nil, fmt.Errorf("%w: required files are missing", ErrInvalidBundle)
+	}
+	// ZIP 已完成所有条目解压，后续 checksum/schema/runtime 安装只读取解压文件。
+	// 立即释放压缩包可显著降低多版本 Snapshot 切换时的峰值磁盘占用。
+	if err := zipReader.Close(); err != nil {
+		return "", nil, err
+	}
+	zipReaderOpen = false
+	if err := os.Remove(archivePath); err != nil {
+		return "", nil, err
 	}
 	checksums, err := readChecksums(filepath.Join(extracted, checksumsFile))
 	if err != nil {
