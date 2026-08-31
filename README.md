@@ -7,6 +7,9 @@ Starcat 的公开 GitHub 仓库 Star 历史数据管道与后端 API。项目包
 
 原始 WatchEvent 始终保留在本地数据盘；云端只保存 `repo_id + 日事件数` 的压缩序列，不保存用户身份、actor、payload 或私有仓库数据。
 
+生产每日追赶由 Starcat 主仓库统一编排；从 ADC、Keychain、T0 权限到四层水位验收的完整步骤见
+[WatchEvent 与 Star History 每日增量运维指南](../../docs/2-产品/需求讨论/推荐算法/WatchEvent与Star-History每日增量运维指南.md)。本 README 重点说明独立服务、Builder 和发布契约。
+
 ## 数据流
 
 ```text
@@ -199,6 +202,9 @@ export HISTORY_BASE_URL=http://127.0.0.1:5014
 scripts/run-daily-pipeline.sh 2026-08-26
 ```
 
+该脚本要求服务已经激活一个 Snapshot。它只允许从现有 `active_watermark` 逐日推进，不能为
+空 Registry 自动创建全量基线；首次部署必须先按上文构建并发布 Snapshot。
+
 默认目录：
 
 - Raw：`/Volumes/T0/Starcat/bigquery/watch-events-2016-2026/raw/gh_archive`
@@ -227,6 +233,59 @@ scripts/run-daily-catch-up.sh 2026-08-30
 随后按相邻日期构建、流式发布并写入每日回执。任一日期失败都停止，重跑会从服务端已经成功的
 水位继续，不会重新应用 Delta。运维脚本直接调用 `builder/.venv` 中的 CLI，不依赖登录 shell
 或全局 `uv`；首次部署必须先执行 Builder 依赖同步。
+
+生产环境不要把 Publish Key 直接写进命令或普通环境文件。推荐从 Starcat 主仓库运行统一入口，
+由它从 macOS Keychain 读取密钥、先补齐 Raw，再调用本脚本：
+
+```bash
+cd /Users/dong4j/Developer/1.AI/ai-incubator/Starcat
+supports/scripts/run-history-daily-sync.sh
+```
+
+分层排障时，Builder 产物和发布结果应按目标日检查：
+
+```bash
+TARGET_DATE=2026-08-30
+TARGET_COMPACT="${TARGET_DATE//-/}"
+HISTORY_DATA_ROOT=/Volumes/T0/Starcat/history
+
+SILVER_DIR="$HISTORY_DATA_ROOT/silver/daily/watch-silver-${TARGET_COMPACT}-v1"
+DELTA_DIR="$HISTORY_DATA_ROOT/deltas/watch-delta-${TARGET_COMPACT}-v1"
+
+jq '{
+  dataset_id,
+  source_watermark,
+  input_checksum,
+  repositories,
+  event_days,
+  watch_events,
+  minimum_event_day,
+  maximum_event_day
+}' "$SILVER_DIR/manifest.json"
+
+jq '{
+  delta_id,
+  from_watermark,
+  to_watermark,
+  source_checksum,
+  rows
+}' "$DELTA_DIR/manifest.json"
+
+jq '{
+  delta_id,
+  target_watermark,
+  response: {
+    active_watermark: .response.active_watermark,
+    applied: .response.applied,
+    rows: .response.rows
+  }
+}' "$DELTA_DIR/publish-receipt.json"
+```
+
+验收条件：Silver 的 `source_watermark` 等于目标日，`minimum_event_day` 与
+`maximum_event_day` 相等（两者是内部日序整数）；Delta 的 `from_watermark` 与生产原水位相邻；
+`to_watermark`、发布回执和 `/internal/v1/history-active` 都等于目标日。只看到本地
+Silver/Delta 文件不能证明生产已经应用。
 
 ## 发布 Snapshot 与 Delta
 
@@ -258,6 +317,10 @@ export HISTORY_GATEWAY_SERVICE=history
 新 Snapshot 覆盖的 Delta 产物；可通过 `SNAPSHOT_RETENTION` 调整保留数。
 服务端还会根据上传包 `Content-Length` 预留解压、可写 runtime 副本和 1 GiB 安全余量；
 容量不足时在读取大包前返回 `507 INSUFFICIENT_STORAGE`。
+
+Delta 校验、序列合并、`applied_deltas` 登记和 active watermark 推进位于同一事务。发布接口
+成功返回后，查询 handler 会立即读取新 active DB；无需重启独立 History API、聚合
+`starcat-api` 或 Starcat。发布失败则继续提供上一 active watermark。
 
 ## 查询 Star 历史
 
