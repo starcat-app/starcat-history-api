@@ -106,6 +106,69 @@ class DailyOptions:
     duckdb: DuckDBOptions
 
 
+@dataclass(frozen=True)
+class CatchUpOptions:
+    """多日追赶任务的 Raw 根目录、目标水位和资源限制。"""
+
+    raw_dir: Path
+    silver_dir: Path
+    delta_dir: Path
+    target_watermark: str
+    duckdb: DuckDBOptions
+
+
+def run_catch_up(options: CatchUpOptions, publisher: HistoryPublisher) -> dict[str, Any]:
+    """从服务端真实水位开始，按相邻 UTC 日连续构建并发布 Delta。"""
+
+    active = publisher.active()
+    active_watermark = str(active.get("active_watermark", ""))
+    if not active_watermark:
+        raise RuntimeError("History Serving 尚未激活 Snapshot，不能执行追赶")
+    current = date.fromisoformat(active_watermark)
+    target = date.fromisoformat(options.target_watermark)
+    if current >= target:
+        return {
+            "status": "no_work",
+            "from_watermark": active_watermark,
+            "active_watermark": active_watermark,
+            "target_watermark": options.target_watermark,
+            "published_days": 0,
+        }
+
+    dates = [current + timedelta(days=offset) for offset in range(1, (target - current).days + 1)]
+    raw_files = [
+        options.raw_dir.resolve() / f"watch-events-{item.strftime('%Y%m%d')}.parquet"
+        for item in dates
+    ]
+    missing = [path.name for path in raw_files if not path.is_file()]
+    if missing:
+        # 先验证整个连续区间，再开始发布，避免一次已知不完整的任务只推进一半水位。
+        raise RuntimeError(f"History 追赶缺少 WatchEvent 分区: {missing[0]}")
+
+    results: list[dict[str, Any]] = []
+    for item, raw_file in zip(dates, raw_files, strict=True):
+        results.append(
+            run_daily(
+                DailyOptions(
+                    [str(raw_file)],
+                    options.silver_dir,
+                    options.delta_dir,
+                    item.isoformat(),
+                    options.duckdb,
+                ),
+                publisher,
+            )
+        )
+    return {
+        "status": "completed",
+        "from_watermark": active_watermark,
+        "active_watermark": options.target_watermark,
+        "target_watermark": options.target_watermark,
+        "published_days": sum(result.get("status") == "published" for result in results),
+        "results": results,
+    }
+
+
 def run_daily(options: DailyOptions, publisher: HistoryPublisher) -> dict[str, Any]:
     """构建并发布一个与服务端当前水位相邻的单日增量。"""
     target = date.fromisoformat(options.target_watermark)

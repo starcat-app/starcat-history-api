@@ -8,11 +8,18 @@ import zipfile
 from pathlib import Path
 
 import duckdb
+import pytest
 
 import starcat_history_builder.build as builder_module
 from starcat_history_builder.build import DuckDBOptions, build_delta, build_silver, build_snapshot
 import starcat_history_builder.daily as daily_module
-from starcat_history_builder.daily import DailyOptions, HTTPHistoryPublisher, run_daily
+from starcat_history_builder.daily import (
+    CatchUpOptions,
+    DailyOptions,
+    HTTPHistoryPublisher,
+    run_catch_up,
+    run_daily,
+)
 
 
 def _parquet(path: Path) -> None:
@@ -50,14 +57,14 @@ def _canonical_parquet(path: Path) -> None:
     connection.close()
 
 
-def _daily_parquet(path: Path) -> None:
+def _daily_parquet(path: Path, event_date: str = "2026-08-25") -> None:
     connection = duckdb.connect()
     connection.execute(
-        """
+        f"""
         COPY (
             SELECT * FROM (VALUES
-                ('c', 'u3', 7::BIGINT, TIMESTAMPTZ '2026-08-25 01:00:00+00'),
-                ('d', 'u4', 8::BIGINT, TIMESTAMPTZ '2026-08-25 02:00:00+00')
+                ('c', 'u3', 7::BIGINT, TIMESTAMPTZ '{event_date} 01:00:00+00'),
+                ('d', 'u4', 8::BIGINT, TIMESTAMPTZ '{event_date} 02:00:00+00')
             ) AS events(source_record_id, actor_id, repo_id, created_at)
         ) TO ? (FORMAT PARQUET)
         """,
@@ -207,6 +214,78 @@ def test_daily_pipeline_is_publishable_and_replay_safe(tmp_path: Path) -> None:
     replay = run_daily(daily, publisher)
     assert replay["status"] == "already_applied"
     assert publisher.uploads == 1
+
+
+def test_catch_up_publishes_each_adjacent_available_day(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    for suffix, event_date in (("20260825", "2026-08-25"), ("20260826", "2026-08-26")):
+        _daily_parquet(raw / f"watch-events-{suffix}.parquet", event_date)
+    options = DuckDBOptions(temp_directory=tmp_path / "spill", memory_limit="1GB", threads=1)
+
+    class FakePublisher:
+        """记录水位推进，确保多日任务始终按相邻日期发布。"""
+
+        def __init__(self) -> None:
+            self.watermark = "2026-08-24"
+            self.delta_ids: list[str] = []
+
+        def active(self) -> dict[str, str]:
+            return {"model_version": "fixture-v1", "active_watermark": self.watermark}
+
+        def publish_delta(self, delta_id: str, archive: Path) -> dict[str, object]:
+            assert archive.is_file()
+            self.delta_ids.append(delta_id)
+            self.watermark = f"{delta_id[12:16]}-{delta_id[16:18]}-{delta_id[18:20]}"
+            return {"delta_id": delta_id, "active_watermark": self.watermark, "applied": True}
+
+    publisher = FakePublisher()
+    result = run_catch_up(
+        CatchUpOptions(
+            raw,
+            tmp_path / "silver",
+            tmp_path / "deltas",
+            "2026-08-26",
+            options,
+        ),
+        publisher,
+    )
+
+    assert result["status"] == "completed"
+    assert result["published_days"] == 2
+    assert publisher.delta_ids == ["watch-delta-20260825-v1", "watch-delta-20260826-v1"]
+
+
+def test_catch_up_rejects_missing_raw_before_publishing(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _daily_parquet(raw / "watch-events-20260825.parquet")
+    options = DuckDBOptions(temp_directory=tmp_path / "spill", memory_limit="1GB", threads=1)
+
+    class FakePublisher:
+        uploads = 0
+
+        @staticmethod
+        def active() -> dict[str, str]:
+            return {"model_version": "fixture-v1", "active_watermark": "2026-08-24"}
+
+        def publish_delta(self, delta_id: str, archive: Path) -> dict[str, object]:
+            self.uploads += 1
+            return {}
+
+    publisher = FakePublisher()
+    with pytest.raises(RuntimeError, match="watch-events-20260826.parquet"):
+        run_catch_up(
+            CatchUpOptions(
+                raw,
+                tmp_path / "silver",
+                tmp_path / "deltas",
+                "2026-08-26",
+                options,
+            ),
+            publisher,
+        )
+    assert publisher.uploads == 0
 
 
 def test_http_history_publisher_sends_aggregate_service_header(monkeypatch) -> None:

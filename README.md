@@ -213,6 +213,20 @@ scripts/run-daily-pipeline.sh 2026-08-26
 Raw 文件必须只包含目标 UTC 日期；已有 Silver/Delta 的来源摘要不一致时任务会拒绝覆盖，
 需要人工确认错误产物，而不是静默复用。
 
+多日缺口使用追赶入口，不需要手工逐日重复命令：
+
+```bash
+export HISTORY_PUBLISH_KEY=local-history-publish-key
+export HISTORY_BASE_URL=https://starcat-api.fly.dev
+export HISTORY_GATEWAY_SERVICE=history
+
+scripts/run-daily-catch-up.sh 2026-08-30
+```
+
+脚本以服务端 `active_watermark` 为事实起点，在发布前先确认目标范围内所有 Raw 分区存在，
+随后按相邻日期构建、流式发布并写入每日回执。任一日期失败都停止，重跑会从服务端已经成功的
+水位继续，不会重新应用 Delta。
+
 ## 发布 Snapshot 与 Delta
 
 独立服务不需要网关头：

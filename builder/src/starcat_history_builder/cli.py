@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 from .build import DuckDBOptions, build_delta, build_silver, build_snapshot
-from .daily import DailyOptions, HTTPHistoryPublisher, run_daily
+from .daily import CatchUpOptions, DailyOptions, HTTPHistoryPublisher, run_catch_up, run_daily
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
@@ -44,6 +44,18 @@ def parser() -> argparse.ArgumentParser:
     daily.add_argument("--publish-key-env", default="HISTORY_PUBLISH_KEY")
     daily.add_argument("--gateway-service", default="", help="聚合网关 X-SC-Svc 值")
     daily.add_argument("--timeout-seconds", type=int, default=600)
+    catch_up = commands.add_parser("catch-up", help="从服务端水位连续发布多日 History Delta")
+    catch_up.add_argument("--raw-dir", type=Path, required=True)
+    catch_up.add_argument("--silver-dir", type=Path, required=True)
+    catch_up.add_argument("--output-dir", type=Path, required=True)
+    catch_up.add_argument("--temp-dir", type=Path, required=True)
+    catch_up.add_argument("--target-watermark", required=True, help="YYYY-MM-DD")
+    catch_up.add_argument("--base-url", required=True)
+    catch_up.add_argument("--publish-key-env", default="HISTORY_PUBLISH_KEY")
+    catch_up.add_argument("--gateway-service", default="")
+    catch_up.add_argument("--timeout-seconds", type=int, default=600)
+    catch_up.add_argument("--memory-limit", default="12GB")
+    catch_up.add_argument("--threads", type=int, default=4)
     return root
 
 
@@ -56,12 +68,31 @@ def main() -> None:
         output = build_silver(args.input, args.output_dir, args.dataset_id, args.watermark, options)
     elif args.command == "delta":
         output = build_delta(args.input, args.output_dir, args.delta_id, args.from_watermark, args.to_watermark, options)
-    else:
+    elif args.command == "daily":
         token = os.environ.get(args.publish_key_env, "")
         if not token:
             raise RuntimeError(f"环境变量 {args.publish_key_env} 未配置")
         output = run_daily(
             DailyOptions(args.input, args.silver_dir, args.output_dir, args.target_watermark, options),
+            HTTPHistoryPublisher(
+                args.base_url,
+                token,
+                args.timeout_seconds,
+                gateway_service=args.gateway_service,
+            ),
+        )
+    else:
+        token = os.environ.get(args.publish_key_env, "")
+        if not token:
+            raise RuntimeError(f"环境变量 {args.publish_key_env} 未配置")
+        output = run_catch_up(
+            CatchUpOptions(
+                args.raw_dir,
+                args.silver_dir,
+                args.output_dir,
+                args.target_watermark,
+                options,
+            ),
             HTTPHistoryPublisher(
                 args.base_url,
                 token,
