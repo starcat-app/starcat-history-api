@@ -3,6 +3,7 @@
 ## 0.1.1-dev
 
 - 新增多日 History Delta 自动追赶，按生产水位连续构建、发布并支持失败续跑。
+- 每日运维脚本改用项目虚拟环境，避免 LaunchAgent 缺少全局 `uv` 时失败。
 - 第三方曲线接口支持可选 `current_stars`：合法时跳过 GitHub metadata。
 - 新增 Starcat 专用 `GET /api/v1/repos/{owner}/{repo}/star-history/events`，只返回原始日事件。
 - 新增 `scripts/install-local-snapshot.sh` / `make install-local-snapshot`，支持本机只拷贝 `history.sqlite` 做联调。

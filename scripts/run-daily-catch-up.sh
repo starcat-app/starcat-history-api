@@ -3,6 +3,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+builder_cli="${repo_root}/builder/.venv/bin/starcat-history-builder"
 target_date="${1:-$(date -u -v-1d +%F)}"
 raw_root="${HISTORY_RAW_ROOT:-/Volumes/T0/Starcat/bigquery/watch-events-2016-2026/raw/gh_archive}"
 history_root="${HISTORY_DATA_ROOT:-/Volumes/T0/Starcat/history}"
@@ -12,9 +13,12 @@ if [[ -z "${HISTORY_PUBLISH_KEY:-}" ]]; then
   echo "HISTORY_PUBLISH_KEY 未配置" >&2
   exit 2
 fi
+if [[ ! -x "${builder_cli}" ]]; then
+  echo "History Builder 未安装，请先在 builder 目录执行 uv sync --extra test --python 3.12" >&2
+  exit 2
+fi
 
-cd "${repo_root}/builder"
-exec uv run starcat-history-builder catch-up \
+exec "${builder_cli}" catch-up \
   --raw-dir "${raw_root}" \
   --silver-dir "${history_root}/silver/daily" \
   --output-dir "${history_root}/deltas" \

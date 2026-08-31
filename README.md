@@ -225,7 +225,8 @@ scripts/run-daily-catch-up.sh 2026-08-30
 
 脚本以服务端 `active_watermark` 为事实起点，在发布前先确认目标范围内所有 Raw 分区存在，
 随后按相邻日期构建、流式发布并写入每日回执。任一日期失败都停止，重跑会从服务端已经成功的
-水位继续，不会重新应用 Delta。
+水位继续，不会重新应用 Delta。运维脚本直接调用 `builder/.venv` 中的 CLI，不依赖登录 shell
+或全局 `uv`；首次部署必须先执行 Builder 依赖同步。
 
 ## 发布 Snapshot 与 Delta
 
