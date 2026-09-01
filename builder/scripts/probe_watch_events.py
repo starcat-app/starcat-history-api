@@ -26,44 +26,55 @@ from pathlib import Path
 import duckdb
 
 # =============================================================================
-# 可改常量 —— 按本机环境改这里即可
+# 可改常量 —— 换机器、账户或数据集时只改这里
 # =============================================================================
 
-# Starcat 本机用户库（用来把 owner/repo → repo_id，并看本地洞察点）
-APP_DB_PATH = Path(
-    "/Users/dong4j/Library/Application Support/com.starcat.app/users/20341123/starcat.sqlite"
-)
+# Starcat 当前账户的 GitHub user ID，用来定位该账户的本地 SQLite。
+STARCAT_USER_ID = "20341123"
 
-# history-api Serving 快照
-SERVING_DB_PATH = Path(
-    "/Users/dong4j/Developer/1.AI/ai-incubator/Starcat/"
-    "supports/starcat-history-api/data/history.sqlite"
-)
+# 本地数据湖公共根目录；Raw、Silver 与 DuckDB 临时文件均由它派生。
+STARCAT_DATA_ROOT = Path("/Volumes/T0/Starcat")
+
+# 当前用于排查的完整 Silver 数据集。
+SILVER_DATASET_ID = "watch-silver-2016-20260825-v1"
+
+# Raw / Silver 水位（与下载 manifest 一致；扫描默认不超过此日）。
+COVERAGE_END = date(2026, 8, 25)
+
+# Raw 全库最早日（仅当本地库没有 created_at、且未传 --repo-id 起算日时作兜底）。
+COVERAGE_START_FALLBACK = date(2016, 1, 1)
+
+# 邻域对照：同窗内 [repo_id-N, repo_id+N] 的命中（说明 Raw 可读）。
+NEARBY_RADIUS = 500
+
+# DuckDB 资源（大扫 Raw 时按机器改）。
+DUCKDB_MEMORY_LIMIT = "8GB"
+DUCKDB_THREADS = 6
+
+# =============================================================================
+# 派生路径 —— 不要在这里写用户名、仓库位置或数据盘绝对路径
+# =============================================================================
+
+# 脚本固定在 <repository>/builder/scripts 下，因此仓库移动后仍能自动定位 Serving DB。
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+APP_SUPPORT_ROOT = Path.home() / "Library/Application Support/com.starcat.app"
+HISTORY_DATA_ROOT = STARCAT_DATA_ROOT / "history"
+
+# Starcat 本机用户库（用来把 owner/repo → repo_id，并看本地洞察点）。
+APP_DB_PATH = APP_SUPPORT_ROOT / "users" / STARCAT_USER_ID / "starcat.sqlite"
+
+# history-api Serving 快照。
+SERVING_DB_PATH = REPOSITORY_ROOT / "data/history.sqlite"
 
 # GH Archive WatchEvent Raw（按日 parquet：watch-events-YYYYMMDD.parquet）
-RAW_WATCH_DIR = Path(
-    "/Volumes/T0/Starcat/bigquery/watch-events-2016-2026/raw/gh_archive"
+RAW_WATCH_DIR = (
+    STARCAT_DATA_ROOT / "bigquery/watch-events-2016-2026/raw/gh_archive"
 )
 RAW_FILE_GLOB = "watch-events-*.parquet"
 
 # History Silver（event_year=*/part_*.parquet）
-SILVER_DATA_DIR = Path(
-    "/Volumes/T0/Starcat/history/silver/watch-silver-2016-20260825-v1/data"
-)
-
-# Raw / Silver 水位（与下载 manifest 一致；扫描默认不超过此日）
-COVERAGE_END = date(2026, 8, 25)
-
-# Raw 全库最早日（仅当本地库没有 created_at、且未传 --repo-id 起算日时作兜底）
-COVERAGE_START_FALLBACK = date(2016, 1, 1)
-
-# 邻域对照：同窗内 [repo_id-N, repo_id+N] 的命中（说明 Raw 可读）
-NEARBY_RADIUS = 500
-
-# DuckDB 资源（大扫 Raw 时按机器改）
-DUCKDB_MEMORY_LIMIT = "8GB"
-DUCKDB_THREADS = 6
-DUCKDB_TEMP_DIR = Path("/Volumes/T0/Starcat/history/tmp")
+SILVER_DATA_DIR = HISTORY_DATA_ROOT / "silver" / SILVER_DATASET_ID / "data"
+DUCKDB_TEMP_DIR = HISTORY_DATA_ROOT / "tmp"
 
 # =============================================================================
 
