@@ -15,7 +15,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # A release is created only after a maintainer explicitly pushes a version tag.
       - name: Create release
