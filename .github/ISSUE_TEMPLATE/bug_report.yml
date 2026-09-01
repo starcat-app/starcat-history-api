@@ -1,0 +1,61 @@
+name: Bug report
+description: Report a reproducible problem in starcat-history-api
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Security vulnerabilities belong in GitHub Security Advisories. Remove tokens, keys, private data, local paths, and credentials from this report.
+  - type: input
+    id: version
+    attributes:
+      label: Affected version or commit
+      placeholder: v1.0.0 or commit SHA
+    validations:
+      required: true
+  - type: input
+    id: component
+    attributes:
+      label: Affected component
+      placeholder: API, Builder, snapshot publication, delta publication, or operations script
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: Operating system, architecture, Go/Python version, and deployment mode
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest reliable sequence. Do not attach generated databases, Raw events, credentials, or private repository data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Remove secrets, user data, local private paths, event payloads, and database content.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and removed sensitive information.
+          required: true
+

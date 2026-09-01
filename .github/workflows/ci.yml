@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+    paths-ignore:
+      - "**/*.md"
+      - LICENSE
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+  pull_request:
+    branches: [main, dev]
+    paths-ignore:
+      - "**/*.md"
+      - LICENSE
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go API
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Check gofmt
+        run: |
+          if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+            echo "gofmt found issues:"
+            gofmt -s -d .
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Build
+        run: go build -v -o starcat-history-api ./cmd/server/
+
+  builder:
+    name: Python Builder
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Pin uv so CI and the committed lockfile are evaluated by a known toolchain.
+      - name: Install uv
+        run: python -m pip install uv==0.12.3
+
+      - name: Verify lockfile and install dependencies
+        working-directory: builder
+        run: uv sync --frozen --extra test --python 3.12
+
+      - name: Run tests
+        working-directory: builder
+        run: uv run pytest -q
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    needs: [go, builder]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # CI validates the self-hosted image but intentionally does not publish a package.
+      - name: Build image
+        run: docker build --tag starcat-history-api:ci .
+

@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest a focused improvement for starcat-history-api
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the API, Builder, data-quality, or maintainer problem this request would solve.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the smallest useful solution and how it preserves the public-data and estimated-history boundaries.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and kept this request scoped to one outcome.
+          required: true
+
