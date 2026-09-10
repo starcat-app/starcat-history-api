@@ -2,12 +2,15 @@
 
 <sub><a href="./README.md">English</a></sub>
 
-Starcat 的公开 GitHub 仓库 Star 历史数据管道与后端 API。项目包含两部分：
+Starcat History API 是面向公开 GitHub 仓库的 Star History 服务，当前实现已经完成：
 
-- 本地 Builder：读取 GH Archive WatchEvent Parquet，生成日级 Silver、完整 Snapshot 和每日 Delta。
-- 云端 API：接收经过校验的 Snapshot/Delta，通过 GitHub 当前 `stargazers_count` 校准历史曲线并向 Starcat 或第三方提供 REST API。
+- 公开曲线和 SVG Embed 接口统一读取 GitHub 官方 `stargazers/history` API。
+- 使用内存 LRU + SQLite 两级缓存，并通过 ETag 增量刷新，避免高频 README 请求反复访问 GitHub。
+- 将官方周级新增数据重建为 Starcat 使用的日级累计曲线，并用当前公开 `stargazers_count` 校准末端。
+- SVG 是不依赖 JavaScript、远程样式或远程图片的自包含图片，可直接放入公开 README。
+- Builder、Snapshot 和 Delta 作为旧原始事件接口的独立数据链路继续保留，不参与公开曲线的数据获取。
 
-原始 WatchEvent 始终保留在本地数据盘；云端只保存 `repo_id + 日事件数` 的压缩序列，不保存用户身份、actor、payload 或私有仓库数据。
+服务不保存用户身份、actor、payload、私有仓库数据或 Starcat 用户数据；Builder 产生的原始 WatchEvent 只保留在本地数据平台。
 
 生产每日追赶由 Starcat 主仓库统一编排；从 ADC、Keychain、T0 权限到四层水位验收的完整步骤见
 [WatchEvent 与 Star History 每日增量运维指南](https://github.com/starcat-app/Starcat/blob/main/docs/2-产品/需求讨论/推荐算法/WatchEvent与Star-History每日增量运维指南.md)。本 README 重点说明独立服务、Builder 和发布契约。
@@ -15,21 +18,20 @@ Starcat 的公开 GitHub 仓库 Star 历史数据管道与后端 API。项目包
 ## 数据流
 
 ```text
-GH Archive WatchEvent Raw Parquet
-  -> History Silver (repo_id + event_day + event_count)
-  -> Snapshot / Daily Delta ZIP
-  -> starcat-history-api Registry
+GitHub /repos/{owner}/{repo}/stargazers/history
+  -> SQLite 周数据缓存 + 内存 LRU
+  -> 日级累计曲线 + 当前 Stars 校准
   -> GET /api/v1/repos/{owner}/{repo}/star-history
-  -> Starcat 项目洞察
+  -> Starcat 项目洞察 / SVG Embed
 ```
 
-WatchEvent 不可靠表达 Unstar，因此服务返回的是估算曲线：
+GitHub 官方接口返回每周 `week`、`total` 和 7 个每日新增值。由于接口不提供历史 Unstar，服务使用当前公开 Star 数作为末端校准锚点：
 
 ```text
 estimatedStars(day) = round(currentStars * cumulativeEvents(day) / totalEvents)
 ```
 
-所有公共点固定标记为 `source=gh_archive`、`precision=estimated`，最后一个覆盖点等于 GitHub 当前 Star 数。
+所有公共点固定标记为 `source=github_history`、`precision=reconstructed`。首次访问会分页拉取官方历史，SQLite 数据缓存 24 小时；过期后使用 ETag 增量刷新，每 7 天做一次全量校验。`/star-history/events` 仍是需要 GH Archive 原始日事件时使用的旧接口。
 
 ## 环境要求
 
@@ -62,6 +64,9 @@ make run
 ```
 
 默认监听 `http://127.0.0.1:5014`。
+
+官方 Star 历史的进程内缓存默认保留 30 分钟，可通过 `.env` 中的
+`OFFICIAL_MEMORY_CACHE_TTL_SECONDS` 调整；该配置只影响内存层，SQLite 官方历史缓存仍为 24 小时。
 
 ```bash
 curl -fsS http://127.0.0.1:5014/healthz
@@ -336,6 +341,8 @@ curl -fsS \
   | jq .
 ```
 
+公开曲线接口直接使用 GitHub 官方历史数据，`repo_id` 可省略；首次请求会全量分页并写入 SQLite，后续进程内优先命中内存 LRU，跨重启优先命中 SQLite，过期后使用 ETag 增量刷新。
+
 - `current_stars` 可选。合法非负整数时直接 `Normalize`，不访问 GitHub。
 - 未传时回退 GitHub metadata（含本地 metadata 缓存）。
 - 支持 `range=3m|1y|all`、`ETag` / `If-None-Match`。Private/Internal 在走 GitHub 路径时仍会拒绝。
@@ -352,12 +359,40 @@ curl -fsS \
 
 `events[].count` 是当日 WatchEvent 数，不是累计星标。
 
+### 在公开 README 中嵌入星标历史
+
+公开 SVG 接口不需要 API key。将下面的 HTML 复制到公开仓库的 README，并替换 `OWNER` 和 `REPO`：
+
+```html
+<picture data-starcat-star-history>
+  <source
+    media="(prefers-color-scheme: dark)"
+    srcset="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=dark&amp;locale=zh">
+  <img
+    alt="OWNER/REPO 星标历史"
+    src="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=light&amp;locale=zh">
+</picture>
+```
+
+接口只接受 `theme=light|dark` 和 `locale=en|zh`，会验证仓库必须为公开仓库，并返回不依赖 JavaScript、远程样式或远程图片的可缓存 SVG。官方接口至少返回两个历史点后才会生成图片。
+
+HTML 属性中的查询参数使用 `&amp;`，命令行 URL 使用普通 `&`。例如，直接获取 SVG 文件：
+
+```bash
+curl -fsS \
+  'https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=light&locale=zh' \
+  -o star-history.svg
+```
+
+本地启动服务后，将域名替换为 `http://127.0.0.1:5014` 即可测试；本地地址只能被当前电脑访问，不能直接用于 GitHub README。
+
 ## 接口
 
 | 方法 | 路径 | 鉴权 | 用途 |
 |---|---|---|---|
 | GET | `/healthz` | 无 | 进程健康检查 |
 | GET | `/api/v1/ping` | `API_KEYS` | 客户端连接检查 |
+| GET | `/embed/v1/repos/{owner}/{repo}/star-history.svg` | 无 | README 可嵌入的公开自包含 SVG |
 | GET | `/api/v1/repos/{owner}/{repo}/star-history` | `API_KEYS` | 查询公开仓库校准曲线（第三方） |
 | GET | `/api/v1/repos/{owner}/{repo}/star-history/events` | `API_KEYS` | 查询原始日事件（Starcat） |
 | GET | `/internal/stats` | `API_KEYS` | 常量时间读取 Serving 规模与水位 |
@@ -376,7 +411,7 @@ curl -fsS \
 - Snapshot 激活使用版本目录和原子 active pointer；失败不会切换当前查询版本。
 - 仓库数、repo-day 和 WatchEvent 总量由 Snapshot 固化、Delta 事务内递增；统计接口不会扫描全量序列表或占用查询连接。
 - 服务不连接 BigQuery，也不读取家庭数据盘；它只消费本地平台主动发布的 Serving 产物。
-- GitHub Token 只用于读取公开仓库当前 metadata；未配置时受 GitHub 匿名限额约束。
+- GitHub Token 用于读取公开仓库当前 metadata 和官方 Star 历史；未配置时受 GitHub 匿名限额约束。
 
 ## 聚合部署
 

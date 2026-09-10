@@ -4,6 +4,7 @@ package serving
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/starcat-app/starcat-history-api/internal/model"
 	"github.com/starcat-app/starcat-history-api/internal/series"
 
 	_ "modernc.org/sqlite"
@@ -33,11 +35,17 @@ type RepositorySeries struct {
 
 // RepositoryMetadata 缓存 GitHub 当前公开元数据，避免每次历史查询都访问 GitHub。
 type RepositoryMetadata struct {
-	RepoID       int64
-	FullName     string
-	Visibility   string
-	CurrentStars int
-	CheckedAt    time.Time
+	RepoID        int64
+	FullName      string
+	Visibility    string
+	CurrentStars  int
+	CheckedAt     time.Time
+	Description   string
+	Language      string
+	Topics        []string
+	CreatedAt     time.Time
+	AvatarURL     string
+	AvatarDataURI string
 }
 
 // ActiveState 描述当前对外服务的数据版本。
@@ -123,8 +131,25 @@ func (s *Store) initialize(ctx context.Context) error {
 			full_name TEXT NOT NULL,
 			visibility TEXT NOT NULL,
 			current_stars INTEGER NOT NULL,
-			checked_at TEXT NOT NULL
+			checked_at TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			language TEXT NOT NULL DEFAULT '',
+			topics_json TEXT NOT NULL DEFAULT '[]',
+			created_at TEXT NOT NULL DEFAULT '',
+			avatar_url TEXT NOT NULL DEFAULT '',
+			avatar_data_uri TEXT NOT NULL DEFAULT ''
 		)`,
+		`CREATE TABLE IF NOT EXISTS github_star_history_cache (
+			owner TEXT NOT NULL,
+			repo TEXT NOT NULL,
+			payload_json TEXT NOT NULL,
+			response_etag TEXT NOT NULL DEFAULT '',
+			fetched_at TEXT NOT NULL,
+			full_history_validated_at TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(owner, repo)
+		)`,
+		`CREATE INDEX IF NOT EXISTS repository_metadata_full_name_index
+			ON repository_metadata(full_name COLLATE NOCASE)`,
 		`CREATE TABLE IF NOT EXISTS history_active (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
 			model_version TEXT NOT NULL,
@@ -148,6 +173,117 @@ func (s *Store) initialize(ctx context.Context) error {
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("initialize serving schema: %w", err)
+		}
+	}
+	if err := s.ensureRepositoryMetadataColumns(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// GitHubStarHistoryCache 读取官方周数据缓存。缓存按规范化 owner/repo 键控，
+// 与 Serving 的 repo_id 无关，避免官方历史接口被旧 GH Archive 数据库结构限制。
+func (s *Store) GitHubStarHistoryCache(ctx context.Context, owner, repo string) (model.GitHubStarHistoryCache, bool, error) {
+	var payload, etag, fetchedAt, validatedAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT payload_json, response_etag, fetched_at, full_history_validated_at
+		FROM github_star_history_cache WHERE owner = ? AND repo = ?`,
+		normalizeCachePart(owner), normalizeCachePart(repo)).Scan(&payload, &etag, &fetchedAt, &validatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.GitHubStarHistoryCache{}, false, nil
+	}
+	if err != nil {
+		return model.GitHubStarHistoryCache{}, false, err
+	}
+	var result model.GitHubStarHistoryCache
+	if err := json.Unmarshal([]byte(payload), &result.Weeks); err != nil {
+		return model.GitHubStarHistoryCache{}, false, fmt.Errorf("parse github star history cache: %w", err)
+	}
+	result.ResponseETag = etag
+	result.FetchedAt, err = time.Parse(time.RFC3339Nano, fetchedAt)
+	if err != nil {
+		return model.GitHubStarHistoryCache{}, false, fmt.Errorf("parse github star history fetched_at: %w", err)
+	}
+	if validatedAt != "" {
+		result.FullHistoryValidatedAt, err = time.Parse(time.RFC3339Nano, validatedAt)
+		if err != nil {
+			return model.GitHubStarHistoryCache{}, false, fmt.Errorf("parse github star history full_history_validated_at: %w", err)
+		}
+	}
+	return result, true, nil
+}
+
+// SaveGitHubStarHistoryCache 原子保存官方历史原始周数据。raw payload 可重新构建，
+// 所以只追加新表，不触碰已经发布的 repo_history_series schema。
+func (s *Store) SaveGitHubStarHistoryCache(ctx context.Context, owner, repo string, value model.GitHubStarHistoryCache) error {
+	payload, err := json.Marshal(value.Weeks)
+	if err != nil {
+		return fmt.Errorf("encode github star history cache: %w", err)
+	}
+	validatedAt := ""
+	if !value.FullHistoryValidatedAt.IsZero() {
+		validatedAt = value.FullHistoryValidatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO github_star_history_cache (
+			owner, repo, payload_json, response_etag, fetched_at, full_history_validated_at
+		) VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(owner, repo) DO UPDATE SET
+			payload_json=excluded.payload_json,
+			response_etag=excluded.response_etag,
+			fetched_at=excluded.fetched_at,
+			full_history_validated_at=excluded.full_history_validated_at`,
+		normalizeCachePart(owner), normalizeCachePart(repo), string(payload), value.ResponseETag,
+		value.FetchedAt.UTC().Format(time.RFC3339Nano), validatedAt)
+	return err
+}
+
+// TouchGitHubStarHistoryCache 处理官方接口 304：数据不变，只推进新鲜时间。
+func (s *Store) TouchGitHubStarHistoryCache(ctx context.Context, owner, repo string, fetchedAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE github_star_history_cache SET fetched_at = ? WHERE owner = ? AND repo = ?`,
+		fetchedAt.UTC().Format(time.RFC3339Nano), normalizeCachePart(owner), normalizeCachePart(repo))
+	return err
+}
+
+func normalizeCachePart(value string) string { return strings.ToLower(strings.TrimSpace(value)) }
+
+// ensureRepositoryMetadataColumns 以追加列方式升级已有 Serving 库。
+// 该服务已经有本地与线上数据库，不能依赖用户删除旧库；列名是代码常量，避免动态 SQL 引入额外输入面。
+func (s *Store) ensureRepositoryMetadataColumns(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(repository_metadata)`)
+	if err != nil {
+		return fmt.Errorf("inspect repository metadata schema: %w", err)
+	}
+	defer rows.Close()
+	columns := make(map[string]struct{})
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("read repository metadata schema: %w", err)
+		}
+		columns[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate repository metadata schema: %w", err)
+	}
+	for _, column := range []string{
+		`description TEXT NOT NULL DEFAULT ''`,
+		`language TEXT NOT NULL DEFAULT ''`,
+		`topics_json TEXT NOT NULL DEFAULT '[]'`,
+		`created_at TEXT NOT NULL DEFAULT ''`,
+		`avatar_url TEXT NOT NULL DEFAULT ''`,
+		`avatar_data_uri TEXT NOT NULL DEFAULT ''`,
+	} {
+		name := strings.Fields(column)[0]
+		if _, exists := columns[name]; exists {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE repository_metadata ADD COLUMN `+column); err != nil {
+			return fmt.Errorf("add repository metadata column %s: %w", name, err)
 		}
 	}
 	return nil
@@ -211,28 +347,81 @@ func (s *Store) UpsertSeries(ctx context.Context, value RepositorySeries) error 
 
 // Metadata 读取 GitHub 元数据缓存。
 func (s *Store) Metadata(ctx context.Context, repoID int64) (RepositoryMetadata, bool, error) {
-	var result RepositoryMetadata
-	var checkedAt string
-	err := s.db.QueryRowContext(ctx, `
-		SELECT repo_id, full_name, visibility, current_stars, checked_at
-		FROM repository_metadata WHERE repo_id = ?`, repoID).Scan(
-		&result.RepoID, &result.FullName, &result.Visibility, &result.CurrentStars, &checkedAt,
-	)
+	result, err := readMetadata(s.db.QueryRowContext(ctx, repositoryMetadataSelect+` WHERE repo_id = ?`, repoID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return RepositoryMetadata{}, false, nil
 	}
 	if err != nil {
 		return RepositoryMetadata{}, false, err
 	}
-	result.CheckedAt, err = time.Parse(time.RFC3339Nano, checkedAt)
+	return result, true, nil
+}
+
+// MetadataByFullName 按 GitHub canonical full_name 查找 metadata，供无 repo_id 的公开图片入口使用。
+// 查询大小写不敏感，与 GitHub owner/repository URL 的语义保持一致。
+func (s *Store) MetadataByFullName(ctx context.Context, fullName string) (RepositoryMetadata, bool, error) {
+	result, err := readMetadata(s.db.QueryRowContext(ctx, repositoryMetadataSelect+` WHERE full_name = ? COLLATE NOCASE ORDER BY checked_at DESC LIMIT 1`, strings.TrimSpace(fullName)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return RepositoryMetadata{}, false, nil
+	}
 	if err != nil {
-		return RepositoryMetadata{}, false, fmt.Errorf("parse metadata checked_at: %w", err)
+		return RepositoryMetadata{}, false, err
 	}
 	return result, true, nil
 }
 
+const repositoryMetadataSelect = `
+	SELECT repo_id, full_name, visibility, current_stars, checked_at,
+	       description, language, topics_json, created_at, avatar_url, avatar_data_uri
+	FROM repository_metadata`
+
+type metadataRow interface {
+	Scan(dest ...any) error
+}
+
+func readMetadata(row metadataRow) (RepositoryMetadata, error) {
+	var result RepositoryMetadata
+	var checkedAt, topicsJSON, createdAt string
+	if err := row.Scan(
+		&result.RepoID, &result.FullName, &result.Visibility, &result.CurrentStars, &checkedAt,
+		&result.Description, &result.Language, &topicsJSON, &createdAt, &result.AvatarURL, &result.AvatarDataURI,
+	); err != nil {
+		return RepositoryMetadata{}, err
+	}
+	var err error
+	result.CheckedAt, err = time.Parse(time.RFC3339Nano, checkedAt)
+	if err != nil {
+		return RepositoryMetadata{}, fmt.Errorf("parse metadata checked_at: %w", err)
+	}
+	if topicsJSON == "" {
+		topicsJSON = "[]"
+	}
+	if err := json.Unmarshal([]byte(topicsJSON), &result.Topics); err != nil {
+		return RepositoryMetadata{}, fmt.Errorf("parse metadata topics: %w", err)
+	}
+	if createdAt != "" {
+		result.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)
+		if err != nil {
+			return RepositoryMetadata{}, fmt.Errorf("parse metadata created_at: %w", err)
+		}
+	}
+	return result, nil
+}
+
 // SaveMetadata 原子更新 GitHub 元数据缓存，并只在首次插入时推进统计计数。
 func (s *Store) SaveMetadata(ctx context.Context, value RepositoryMetadata) error {
+	topics := value.Topics
+	if topics == nil {
+		topics = []string{}
+	}
+	topicsJSON, err := json.Marshal(topics)
+	if err != nil {
+		return fmt.Errorf("encode metadata topics: %w", err)
+	}
+	createdAt := ""
+	if !value.CreatedAt.IsZero() {
+		createdAt = value.CreatedAt.UTC().Format(time.RFC3339Nano)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -250,15 +439,25 @@ func (s *Store) SaveMetadata(ctx context.Context, value RepositoryMetadata) erro
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO repository_metadata (repo_id, full_name, visibility, current_stars, checked_at)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO repository_metadata (
+			repo_id, full_name, visibility, current_stars, checked_at,
+			description, language, topics_json, created_at, avatar_url, avatar_data_uri
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repo_id) DO UPDATE SET
 			full_name=excluded.full_name,
 			visibility=excluded.visibility,
 			current_stars=excluded.current_stars,
-			checked_at=excluded.checked_at`,
+			checked_at=excluded.checked_at,
+			description=excluded.description,
+			language=excluded.language,
+			topics_json=excluded.topics_json,
+			created_at=excluded.created_at,
+			avatar_url=excluded.avatar_url,
+			avatar_data_uri=excluded.avatar_data_uri`,
 		value.RepoID, value.FullName, value.Visibility, value.CurrentStars,
-		value.CheckedAt.UTC().Format(time.RFC3339Nano),
+		value.CheckedAt.UTC().Format(time.RFC3339Nano), value.Description, value.Language,
+		string(topicsJSON), createdAt, value.AvatarURL, value.AvatarDataURI,
 	); err != nil {
 		return err
 	}

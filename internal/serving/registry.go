@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/starcat-app/starcat-history-api/internal/model"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -195,10 +197,38 @@ func (r *Registry) Metadata(ctx context.Context, repoID int64) (RepositoryMetada
 	return r.store.Metadata(ctx, repoID)
 }
 
+// MetadataByFullName 在当前 active store 中按公开仓库名读取 metadata。
+func (r *Registry) MetadataByFullName(ctx context.Context, fullName string) (RepositoryMetadata, bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.store.MetadataByFullName(ctx, fullName)
+}
+
 func (r *Registry) SaveMetadata(ctx context.Context, value RepositoryMetadata) error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.store.SaveMetadata(ctx, value)
+}
+
+// GitHubStarHistoryCache 代理当前 active store 的官方历史缓存读取。
+func (r *Registry) GitHubStarHistoryCache(ctx context.Context, owner, repo string) (model.GitHubStarHistoryCache, bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.store.GitHubStarHistoryCache(ctx, owner, repo)
+}
+
+// SaveGitHubStarHistoryCache 代理官方历史缓存写入。
+func (r *Registry) SaveGitHubStarHistoryCache(ctx context.Context, owner, repo string, value model.GitHubStarHistoryCache) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.store.SaveGitHubStarHistoryCache(ctx, owner, repo, value)
+}
+
+// TouchGitHubStarHistoryCache 代理官方历史 304 的时间戳更新。
+func (r *Registry) TouchGitHubStarHistoryCache(ctx context.Context, owner, repo string, fetchedAt time.Time) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.store.TouchGitHubStarHistoryCache(ctx, owner, repo, fetchedAt)
 }
 
 func (r *Registry) Active(ctx context.Context) (ActiveState, error) {

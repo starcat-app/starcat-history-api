@@ -56,6 +56,8 @@ func seedHistoryFixture(t *testing.T) (*serving.Store, *HistoryHandler, *fakeMet
 	}
 	metadata := serving.RepositoryMetadata{
 		RepoID: 42, FullName: "owner/repo", Visibility: "public", CurrentStars: 100, CheckedAt: generatedAt,
+		Description: "A repository", Language: "Go", Topics: []string{"history"},
+		CreatedAt: time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC),
 	}
 	provider := &fakeMetadataProvider{value: metadata}
 	handler := NewHistoryHandler(store, provider, time.Hour, 400)

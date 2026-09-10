@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/starcat-app/starcat-history-api/internal/cache"
 	"github.com/starcat-app/starcat-history-api/internal/model"
 	"github.com/starcat-app/starcat-history-api/internal/provider"
 	"github.com/starcat-app/starcat-history-api/internal/series"
@@ -24,34 +25,84 @@ var repositoryPathPart = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
 type HistoryStore interface {
 	Series(context.Context, int64) (serving.RepositorySeries, error)
 	Metadata(context.Context, int64) (serving.RepositoryMetadata, bool, error)
+	MetadataByFullName(context.Context, string) (serving.RepositoryMetadata, bool, error)
 	SaveMetadata(context.Context, serving.RepositoryMetadata) error
 	Active(context.Context) (serving.ActiveState, error)
 }
 
-// HistoryHandler 从预计算压缩序列生成客户端兼容响应。
+// GitHubHistoryCacheStore 是官方周数据的持久化缓存能力。它独立于旧的 GH Archive
+// 序列，保证官方历史可用性不再受 repo_history_series 覆盖范围影响。
+type GitHubHistoryCacheStore interface {
+	GitHubStarHistoryCache(context.Context, string, string) (model.GitHubStarHistoryCache, bool, error)
+	SaveGitHubStarHistoryCache(context.Context, string, string, model.GitHubStarHistoryCache) error
+	TouchGitHubStarHistoryCache(context.Context, string, string, time.Time) error
+}
+
+// HistoryHandlerOption 配置官方历史数据源。
+type HistoryHandlerOption func(*HistoryHandler)
+
+// WithStarHistoryProvider 让查询链路使用 GitHub 官方 Star 历史接口。
+func WithStarHistoryProvider(value provider.StarHistoryProvider) HistoryHandlerOption {
+	return func(h *HistoryHandler) { h.starHistory = value }
+}
+
+// WithOfficialMemoryCacheTTL 设置官方历史 payload 的进程内缓存时长。
+// 小于等于 0 的值会被忽略，避免调用方无意中关闭缓存并放大 SQLite 读取。
+func WithOfficialMemoryCacheTTL(value time.Duration) HistoryHandlerOption {
+	return func(h *HistoryHandler) {
+		if value > 0 {
+			h.officialMemoryCacheTTL = value
+		}
+	}
+}
+
+// HistoryHandler 生成客户端兼容响应；生产配置优先使用 GitHub 官方周历史，
+// 旧压缩序列只保留给 /events 原始事件接口和未装配官方 provider 的兼容测试。
 type HistoryHandler struct {
-	store         HistoryStore
-	metadata      provider.MetadataProvider
-	metadataTTL   time.Duration
-	maximumPoints int
-	now           func() time.Time
+	store                  HistoryStore
+	metadata               provider.MetadataProvider
+	starHistory            provider.StarHistoryProvider
+	historyCache           GitHubHistoryCacheStore
+	memory                 *cache.LRU
+	flights                *cache.Group
+	metadataTTL            time.Duration
+	officialMemoryCacheTTL time.Duration
+	maximumPoints          int
+	now                    func() time.Time
 }
 
 // NewHistoryHandler 创建查询 handler。
-func NewHistoryHandler(store HistoryStore, metadata provider.MetadataProvider, metadataTTL time.Duration, maximumPoints int) *HistoryHandler {
+func NewHistoryHandler(store HistoryStore, metadata provider.MetadataProvider, metadataTTL time.Duration, maximumPoints int, options ...HistoryHandlerOption) *HistoryHandler {
 	if metadataTTL <= 0 {
 		metadataTTL = 24 * time.Hour
 	}
 	if maximumPoints <= 0 {
 		maximumPoints = series.DefaultMaximumPoints
 	}
-	return &HistoryHandler{store: store, metadata: metadata, metadataTTL: metadataTTL, maximumPoints: maximumPoints, now: time.Now}
+	handler := &HistoryHandler{
+		store: store, metadata: metadata, metadataTTL: metadataTTL,
+		officialMemoryCacheTTL: DefaultOfficialMemoryCacheTTL, maximumPoints: maximumPoints,
+		now: time.Now, memory: cache.NewLRU(512), flights: &cache.Group{},
+	}
+	for _, option := range options {
+		if option != nil {
+			option(handler)
+		}
+	}
+	if persisted, ok := store.(GitHubHistoryCacheStore); ok {
+		handler.historyCache = persisted
+	}
+	return handler
 }
 
 // HandleStarHistory 处理 GET /api/v1/repos/{owner}/{repo}/star-history。
 //
-// 可选 query `current_stars`：合法时直接校准，不访问 GitHub；缺省时回退 GitHub metadata。
+// 可选 query `current_stars`：合法时直接校准，不访问 GitHub metadata；缺省时读取公开 metadata。
 func (h *HistoryHandler) HandleStarHistory(w http.ResponseWriter, r *http.Request) {
+	if h.starHistory != nil {
+		h.handleOfficialStarHistory(w, r)
+		return
+	}
 	owner, repo, repoID, ok := parseRepositoryIdentity(w, r)
 	if !ok {
 		return
@@ -130,6 +181,10 @@ func (h *HistoryHandler) HandleStarHistoryEvents(w http.ResponseWriter, r *http.
 	if !ok {
 		return
 	}
+	if repoID <= 0 {
+		writeError(w, http.StatusBadRequest, "INVALID_REPOSITORY", "repo_id is required for events.", nil)
+		return
+	}
 
 	storedSeries, events, ok := h.loadDecodedSeries(w, r, repoID)
 	if !ok {
@@ -184,9 +239,13 @@ func parseRepositoryIdentity(w http.ResponseWriter, r *http.Request) (owner, rep
 		writeError(w, http.StatusBadRequest, "INVALID_REPOSITORY", "Invalid repository path.", nil)
 		return "", "", 0, false
 	}
-	repoID, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("repo_id")), 10, 64)
+	rawRepoID := strings.TrimSpace(r.URL.Query().Get("repo_id"))
+	if rawRepoID == "" {
+		return owner, repo, 0, true
+	}
+	repoID, err := strconv.ParseInt(rawRepoID, 10, 64)
 	if err != nil || repoID <= 0 {
-		writeError(w, http.StatusBadRequest, "INVALID_REPOSITORY", "repo_id is required.", nil)
+		writeError(w, http.StatusBadRequest, "INVALID_REPOSITORY", "repo_id must be a positive integer.", nil)
 		return "", "", 0, false
 	}
 	return owner, repo, repoID, true
@@ -239,7 +298,7 @@ func (h *HistoryHandler) requirePublicMetadata(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusServiceUnavailable, "GITHUB_ERROR", "Unable to refresh repository metadata.", nil)
 		return serving.RepositoryMetadata{}, false
 	}
-	if metadata.RepoID != repoID {
+	if repoID > 0 && metadata.RepoID != repoID {
 		writeError(w, http.StatusConflict, "REPOSITORY_ID_MISMATCH", "Repository ID does not match the requested path.", nil)
 		return serving.RepositoryMetadata{}, false
 	}
@@ -281,8 +340,44 @@ func (h *HistoryHandler) resolveMetadata(ctx context.Context, repoID int64, owne
 		}
 		return serving.RepositoryMetadata{}, err
 	}
-	if fresh.RepoID != repoID {
+	if repoID > 0 && fresh.RepoID != repoID {
 		return serving.RepositoryMetadata{}, provider.ErrNotFound
+	}
+	if err := h.store.SaveMetadata(ctx, fresh); err != nil {
+		return serving.RepositoryMetadata{}, err
+	}
+	return fresh, nil
+}
+
+// resolvePublicMetadata 按 owner/repo 解析公开嵌入所需的不可变 repo ID。
+//
+// README 图片请求不可能携带 Starcat API key，因此先使用完整仓库名缓存，再在 TTL
+// 到期时调用 GitHub 官方 metadata。缓存命中仍需保持 Public 门禁，避免仓库变私有后
+// 继续把历史曲线暴露给公开图片地址。
+func (h *HistoryHandler) resolvePublicMetadata(ctx context.Context, owner, repo string) (serving.RepositoryMetadata, error) {
+	fullName := owner + "/" + repo
+	cached, found, err := h.store.MetadataByFullName(ctx, fullName)
+	if err != nil {
+		return serving.RepositoryMetadata{}, err
+	}
+	if found && h.now().UTC().Sub(cached.CheckedAt) < h.metadataTTL {
+		return cached, nil
+	}
+	if h.metadata == nil {
+		if found && cached.Visibility == "public" {
+			return cached, nil
+		}
+		return serving.RepositoryMetadata{}, fmt.Errorf("metadata provider is not configured")
+	}
+	fresh, err := h.metadata.Fetch(ctx, owner, repo)
+	if err != nil {
+		if found && cached.Visibility == "public" {
+			return cached, nil
+		}
+		return serving.RepositoryMetadata{}, err
+	}
+	if fresh.Visibility != "public" {
+		return fresh, nil
 	}
 	if err := h.store.SaveMetadata(ctx, fresh); err != nil {
 		return serving.RepositoryMetadata{}, err

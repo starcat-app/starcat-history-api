@@ -3,6 +3,30 @@ package model
 
 import "time"
 
+// GitHubStarHistoryWeek 是 GitHub 官方 stargazers/history 的一周数据。
+// Week 是该周周日的 Unix 时间戳，Days 按周日到周六存储每日新增 Star 数。
+type GitHubStarHistoryWeek struct {
+	Week  int64 `json:"week"`
+	Total int   `json:"total"`
+	Days  []int `json:"days"`
+}
+
+// GitHubStarHistoryCache 是官方周数据在内存和 SQLite 中共用的缓存载荷。
+// 当前 Star 数不放进载荷，因为它来自仓库 metadata，且每次重建都需要以最新值校准。
+type GitHubStarHistoryCache struct {
+	Weeks                  []GitHubStarHistoryWeek `json:"weeks"`
+	ResponseETag           string                  `json:"response_etag,omitempty"`
+	FetchedAt              time.Time               `json:"fetched_at"`
+	FullHistoryValidatedAt time.Time               `json:"full_history_validated_at"`
+}
+
+// GitHubStarHistoryWeekResponse 是单页官方接口响应及其 HTTP 缓存信息。
+type GitHubStarHistoryWeekResponse struct {
+	Weeks        []GitHubStarHistoryWeek
+	ResponseETag string
+	NotModified  bool
+}
+
 // HistoryRange 是客户端支持的历史窗口。
 type HistoryRange string
 

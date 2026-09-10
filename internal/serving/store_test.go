@@ -27,12 +27,21 @@ func TestStoreRoundTrip(t *testing.T) {
 	if err := store.EnsureStatistics(ctx, Stats{Repositories: 1, EventDays: 2, WatchEvents: 3}); err != nil {
 		t.Fatal(err)
 	}
-	metadata := RepositoryMetadata{RepoID: 1, FullName: "owner/repo", Visibility: "public", CurrentStars: 42, CheckedAt: time.Now().UTC()}
+	metadata := RepositoryMetadata{
+		RepoID: 1, FullName: "owner/repo", Visibility: "public", CurrentStars: 42, CheckedAt: time.Now().UTC(),
+		Description: "A repository", Language: "Go", Topics: []string{"history", "github"},
+		CreatedAt: time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC), AvatarURL: "https://avatars.example.test/1.png",
+		AvatarDataURI: "data:image/png;base64,AAAA",
+	}
 	if err := store.SaveMetadata(ctx, metadata); err != nil {
 		t.Fatal(err)
 	}
 	if gotMetadata, ok, err := store.Metadata(ctx, 1); err != nil || !ok || gotMetadata.FullName != metadata.FullName {
 		t.Fatalf("unexpected metadata: %#v %v %v", gotMetadata, ok, err)
+	}
+	gotMetadata, ok, err := store.MetadataByFullName(ctx, "OWNER/REPO")
+	if err != nil || !ok || gotMetadata.Description != metadata.Description || gotMetadata.Language != metadata.Language || len(gotMetadata.Topics) != 2 || gotMetadata.CreatedAt != metadata.CreatedAt || gotMetadata.AvatarDataURI != metadata.AvatarDataURI {
+		t.Fatalf("metadata details did not round trip: %#v %v %v", gotMetadata, ok, err)
 	}
 	metadata.CurrentStars = 43
 	if err := store.SaveMetadata(ctx, metadata); err != nil {

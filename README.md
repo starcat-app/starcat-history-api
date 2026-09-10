@@ -4,7 +4,7 @@
 <div align="center">
 <a href="https://starcat.ink"><img src="https://raw.githubusercontent.com/starcat-app/starcat-pro/main/banner.webp" width="100%" alt="Starcat" /></a>
 
-<p><strong>Starcat's self-hostable API and local data pipeline for estimated public GitHub Star history.</strong></p>
+<p><strong>Starcat's self-hostable API and cache-first public GitHub Star history service.</strong></p>
 <p>Starcat is a native macOS app that turns GitHub Stars into a searchable, organized and AI-assisted local knowledge base, with a broader ecosystem of desktop clients, plugins, CLI tools, and self-hostable services.</p>
 
 <a href="https://github.com/starcat-app/homebrew-starcat"><img src="https://img.shields.io/badge/Install%20with-Homebrew-FBBF24?style=for-the-badge&logo=homebrew&logoColor=white" width="220" alt="Install with Homebrew"/></a>
@@ -56,33 +56,35 @@ brew install --cask starcat
 > Starcat provides hosted defaults for normal users. This API is designed so advanced users can inspect it, run it locally, or deploy their own instance after the repository's public-release review is complete.
 <!-- starcat-promo:end -->
 
-`starcat-history-api` builds and serves estimated Star-history curves for public GitHub repositories. It contains two deliberately separated components:
+`starcat-history-api` is a public GitHub Star History service for self-hosted deployments. The current implementation is complete in the following areas:
 
-- **Local Builder** reads GH Archive `WatchEvent` Parquet files and produces auditable daily Silver datasets, immutable full snapshots, and adjacent daily deltas.
-- **Serving API** validates and activates published snapshots or deltas, calibrates event curves against the current public GitHub `stargazers_count`, and exposes stable REST endpoints to Starcat and self-hosted clients.
+- Public curve and SVG Embed endpoints use GitHub's official `stargazers/history` API.
+- An in-memory LRU plus SQLite two-level cache uses ETags for incremental refreshes, so high-volume README requests do not repeatedly hit GitHub.
+- Weekly increments are rebuilt into Starcat-compatible daily cumulative points and calibrated against the current public `stargazers_count`.
+- The SVG is self-contained and does not require JavaScript, remote styles, or remote images, so it can be embedded directly in a public README.
+- Builder, Snapshot, and Delta remain as a separate legacy raw-event data path and are not used to fetch public curve history.
 
-Raw GH Archive events remain on the local data platform. Published serving bundles contain only compressed `repo_id + event_day + event_count` series. They do not contain GitHub actors, event payloads, Starcat users, credentials, private repositories, notes, tags, searches, or AI/RAG content.
+The service does not store GitHub identities, actors, event payloads, private repository data, or Starcat user data. Raw GH Archive WatchEvents produced by the Builder remain on the local data platform.
 
 For the full Chinese operations guide, see [README-ZH.md](./README-ZH.md). Production daily orchestration is documented in the Starcat repository's [WatchEvent and Star History daily incremental operations guide](https://github.com/starcat-app/Starcat/blob/main/docs/2-产品/需求讨论/推荐算法/WatchEvent与Star-History每日增量运维指南.md).
 
 ## Data flow
 
 ```text
-GH Archive WatchEvent Raw Parquet
-  -> History Silver (repo_id + event_day + event_count)
-  -> Snapshot / Daily Delta ZIP
-  -> starcat-history-api Registry
+GitHub /repos/{owner}/{repo}/stargazers/history
+  -> SQLite weekly payload cache + in-memory LRU
+  -> daily cumulative curve + current-Star calibration
   -> GET /api/v1/repos/{owner}/{repo}/star-history
-  -> Starcat repository insights
+  -> Starcat repository insights / SVG Embed
 ```
 
-GH Archive does not reliably express Unstar events. The public curve is therefore an estimate:
+GitHub returns weekly `week`, `total`, and seven daily increment values. Since the API does not provide historical Unstar events, the service uses the current public Star count as the final calibration anchor:
 
 ```text
 estimatedStars(day) = round(currentStars * cumulativeEvents(day) / totalEvents)
 ```
 
-Every public point is marked with `source=gh_archive` and `precision=estimated`. The final covered point is fixed to the repository's current public Star count.
+Every public point is marked with `source=github_history` and `precision=reconstructed`. A cold repository fetch paginates the official endpoint, SQLite history remains fresh for 24 hours, and expired data uses an ETag incremental refresh; a full validation is performed after seven days. `/star-history/events` remains the legacy GH Archive raw-event endpoint for Starcat clients that explicitly need it.
 
 ## Requirements
 
@@ -127,6 +129,10 @@ make run
 ```
 
 The default listener is `http://127.0.0.1:5014`.
+
+The in-process cache for official Star history defaults to 30 minutes and can be tuned with
+`OFFICIAL_MEMORY_CACHE_TTL_SECONDS` in `.env`. This only changes the memory layer; the SQLite
+official-history cache remains valid for 24 hours.
 
 ```bash
 curl -fsS http://127.0.0.1:5014/healthz
@@ -246,6 +252,7 @@ Snapshot activation keeps the previous active version available until the new ve
 |---|---|---|---|
 | `GET` | `/healthz` | None | Process health check |
 | `GET` | `/api/v1/ping` | `API_KEYS` | Client connectivity probe |
+| `GET` | `/embed/v1/repos/{owner}/{repo}/star-history.svg` | None | Public self-contained SVG for README embedding |
 | `GET` | `/api/v1/repos/{owner}/{repo}/star-history` | `API_KEYS` | Calibrated public-repository curve |
 | `GET` | `/api/v1/repos/{owner}/{repo}/star-history/events` | `API_KEYS` | Raw daily event counts for Starcat-side calibration |
 | `GET` | `/internal/stats` | `API_KEYS` | Constant-time serving scale and watermark statistics |
@@ -271,7 +278,34 @@ curl -fsS \
   'http://127.0.0.1:5014/api/v1/repos/vinta/awesome-python/star-history/events?repo_id=21289110'
 ```
 
-The compatibility endpoint supports `range=3m|1y|all`, `ETag`, and `If-None-Match`. Supplying a valid non-negative `current_stars` avoids a GitHub metadata request. The event endpoint never requests GitHub metadata; its `events[].count` values are daily WatchEvent counts, not cumulative Star counts.
+The compatibility endpoint supports `range=3m|1y|all`, `ETag`, and `If-None-Match`. `repo_id` is optional for the official-history path; supplying a valid non-negative `current_stars` also avoids a GitHub metadata request. The event endpoint still requires `repo_id`, never requests GitHub metadata, and returns daily WatchEvent counts rather than cumulative Star counts.
+
+### Embed Star History in a public README
+
+The public SVG endpoint does not require an API key. Copy the following HTML into a public repository README, then replace `OWNER` and `REPO`:
+
+```html
+<picture data-starcat-star-history>
+  <source
+    media="(prefers-color-scheme: dark)"
+    srcset="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=dark&amp;locale=en">
+  <img
+    alt="OWNER/REPO Star History"
+    src="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=light&amp;locale=en">
+</picture>
+```
+
+The endpoint accepts only `theme=light|dark` and `locale=en|zh`, verifies that the repository is public, and returns a cacheable SVG without JavaScript, remote styles, or remote images. A repository must have at least two history points from the official endpoint before an image is available.
+
+Use `&amp;` for query separators inside HTML attributes and plain `&` in shell commands. To download the SVG directly:
+
+```bash
+curl -fsS \
+  'https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=light&locale=en' \
+  -o star-history.svg
+```
+
+For local testing, replace the host with `http://127.0.0.1:5014`. A localhost URL is accessible only from the current machine and cannot be used directly by GitHub README rendering.
 
 ## Security and privacy boundary
 
@@ -279,7 +313,7 @@ The compatibility endpoint supports `range=3m|1y|all`, `ETag`, and `If-None-Matc
 - Uploads accept only the documented ZIP allowlist and validate streaming SHA-256, manifest contents, SQLite schema, statistics, and watermarks.
 - The service never connects to BigQuery or a private home network and never reads the local Raw data lake.
 - Published data excludes actors, event payloads, Starcat identities, credentials, and private or internal repository data.
-- GitHub tokens, when configured, are used only to read current public repository metadata.
+- GitHub tokens, when configured, are used to read current public repository metadata and the official public Star history endpoint.
 - Vulnerabilities should be reported privately through GitHub Security Advisories, as described in [SECURITY.md](./SECURITY.md).
 
 ## Deployment boundary

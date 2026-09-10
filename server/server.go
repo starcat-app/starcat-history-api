@@ -44,6 +44,7 @@ type Options struct {
 	RegistryDir            string
 	MetricsStoreFile       string
 	MetadataTTL            time.Duration
+	OfficialMemoryCacheTTL time.Duration
 	MaximumPoints          int
 	MaxBundleBytes         int64
 	SnapshotRetention      int
@@ -69,18 +70,19 @@ func FromEnv() (*Service, error) {
 		return nil, err
 	}
 	return New(Options{
-		Port:              kitenv.OrDefault("PORT", defaultPort),
-		APIKeys:           apiKeys,
-		PublishKeys:       optionalListEnv("PUBLISH_KEYS"),
-		GitHubToken:       strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
-		GitHubEndpoint:    kitenv.OrDefault("GITHUB_API_ENDPOINT", "https://api.github.com"),
-		StoreFile:         envOrDefault("STORE_FILE", defaultStoreFile),
-		RegistryDir:       envOrDefault("REGISTRY_DIR", defaultRegistryDir),
-		MetricsStoreFile:  envOrDefault("METRICS_STORE_FILE", "./data/history-metrics.db"),
-		MetadataTTL:       kitenv.DurationSeconds("METADATA_TTL_SECONDS", 24*time.Hour),
-		MaximumPoints:     intEnv("MAXIMUM_HISTORY_POINTS", series.DefaultMaximumPoints),
-		MaxBundleBytes:    int64Env("MAX_BUNDLE_BYTES", defaultMaxBundleBytes),
-		SnapshotRetention: intEnv("SNAPSHOT_RETENTION", defaultSnapshotRetention),
+		Port:                   kitenv.OrDefault("PORT", defaultPort),
+		APIKeys:                apiKeys,
+		PublishKeys:            optionalListEnv("PUBLISH_KEYS"),
+		GitHubToken:            strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
+		GitHubEndpoint:         kitenv.OrDefault("GITHUB_API_ENDPOINT", "https://api.github.com"),
+		StoreFile:              envOrDefault("STORE_FILE", defaultStoreFile),
+		RegistryDir:            envOrDefault("REGISTRY_DIR", defaultRegistryDir),
+		MetricsStoreFile:       envOrDefault("METRICS_STORE_FILE", "./data/history-metrics.db"),
+		MetadataTTL:            kitenv.DurationSeconds("METADATA_TTL_SECONDS", 24*time.Hour),
+		OfficialMemoryCacheTTL: kitenv.DurationSeconds("OFFICIAL_MEMORY_CACHE_TTL_SECONDS", handler.DefaultOfficialMemoryCacheTTL),
+		MaximumPoints:          intEnv("MAXIMUM_HISTORY_POINTS", series.DefaultMaximumPoints),
+		MaxBundleBytes:         int64Env("MAX_BUNDLE_BYTES", defaultMaxBundleBytes),
+		SnapshotRetention:      intEnv("SNAPSHOT_RETENTION", defaultSnapshotRetention),
 	})
 }
 
@@ -103,6 +105,9 @@ func New(opt Options) (*Service, error) {
 	}
 	if opt.MetadataTTL <= 0 {
 		opt.MetadataTTL = 24 * time.Hour
+	}
+	if opt.OfficialMemoryCacheTTL <= 0 {
+		opt.OfficialMemoryCacheTTL = handler.DefaultOfficialMemoryCacheTTL
 	}
 	if opt.MaximumPoints <= 0 {
 		opt.MaximumPoints = series.DefaultMaximumPoints
@@ -129,13 +134,22 @@ func New(opt Options) (*Service, error) {
 		return nil, fmt.Errorf("initialize metrics collector: %w", err)
 	}
 	metadataProvider := provider.NewGitHubProvider(opt.GitHubEndpoint, opt.GitHubToken, nil)
-	historyHandler := handler.NewHistoryHandler(registry, metadataProvider, opt.MetadataTTL, opt.MaximumPoints)
+	// 历史曲线与仓库 metadata 共用 GitHub client，但数据源明确切换到官方
+	// stargazers/history；旧 repo_history_series 仅继续服务 /events 调试接口。
+	historyHandler := handler.NewHistoryHandler(
+		registry, metadataProvider, opt.MetadataTTL, opt.MaximumPoints,
+		handler.WithStarHistoryProvider(metadataProvider),
+		handler.WithOfficialMemoryCacheTTL(opt.OfficialMemoryCacheTTL),
+	)
 	auth := middleware.NewBearerAuth(opt.APIKeys)
 	metricsHandler := kitmetrics.NewHandler(Name(), metrics.Store())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthzHandler)
 	mux.Handle("GET /api/v1/ping", auth.Wrap(handler.HandlePing(Name(), version.Version)))
+	// README 的 <img> 请求无法携带 API_KEYS；公开 embed 仅允许固定的 SVG 参数，
+	// handler 内部仍会按 owner/repo 做 GitHub Public 校验和 Serving 历史门禁。
+	mux.Handle("GET /embed/v1/repos/{owner}/{repo}/star-history.svg", http.HandlerFunc(historyHandler.HandleStarHistoryEmbed))
 	mux.Handle("GET /api/v1/repos/{owner}/{repo}/star-history", auth.Wrap(http.HandlerFunc(historyHandler.HandleStarHistory)))
 	mux.Handle("GET /api/v1/repos/{owner}/{repo}/star-history/events", auth.Wrap(http.HandlerFunc(historyHandler.HandleStarHistoryEvents)))
 	mux.Handle("GET /internal/stats", auth.Wrap(handler.HandleStats(registry)))
@@ -153,6 +167,7 @@ func New(opt Options) (*Service, error) {
 	}
 	if !opt.SkipListenLogEndpoints {
 		log.Printf("starcat-history-api %s endpoints ready", version.Version)
+		log.Printf("  GET /embed/v1/repos/{owner}/{repo}/star-history.svg")
 		log.Printf("  GET /api/v1/repos/{owner}/{repo}/star-history")
 		log.Printf("  GET /api/v1/repos/{owner}/{repo}/star-history/events")
 		log.Printf("  GET /internal/stats")

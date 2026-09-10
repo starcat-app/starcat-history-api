@@ -14,6 +14,17 @@ const DefaultMaximumPoints = 400
 // GH Archive 不含可靠的 unstar 反向事件，因此这里保持与旧 Discovery 实现一致：
 // 只提供单调、估算曲线，并强制最后一个点等于 GitHub 当前值。
 func Normalize(events []DayCount, currentStars int) ([]model.HistoryPoint, error) {
+	return normalize(events, currentStars, "gh_archive", "estimated")
+}
+
+// NormalizeOfficial 把 GitHub 官方每日新增 Star 重建为累计曲线。
+// 官方接口提供真实的新增事件，但不提供 unstar 反向历史，因此仍需用当前 stars
+// 作为末端锚点；source/precision 明确告诉客户端这是官方历史的重建曲线。
+func NormalizeOfficial(events []DayCount, currentStars int) ([]model.HistoryPoint, error) {
+	return normalize(events, currentStars, "github_history", "reconstructed")
+}
+
+func normalize(events []DayCount, currentStars int, source, precision string) ([]model.HistoryPoint, error) {
 	if currentStars < 0 {
 		return nil, fmt.Errorf("current_stars must not be negative")
 	}
@@ -46,8 +57,8 @@ func Normalize(events []DayCount, currentStars int) ([]model.HistoryPoint, error
 		points = append(points, model.HistoryPoint{
 			Date:      TimeFromDay(event.Day).Format("2006-01-02"),
 			Count:     estimated,
-			Source:    "gh_archive",
-			Precision: "estimated",
+			Source:    source,
+			Precision: precision,
 		})
 		previous = estimated
 	}
