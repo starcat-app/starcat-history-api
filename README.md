@@ -101,7 +101,7 @@ Every public point is marked with `source=github_history` and `precision=reconst
 - Go 1.25+
 - Docker, only when validating or building the container image
 
-A `GITHUB_TOKEN` is optional; without one the service runs under GitHub's anonymous rate limits.
+`GITHUB_TOKENS` (comma-separated pool, round shared across requests) or `GITHUB_TOKEN` (single) is optional; without one the service runs under GitHub's anonymous rate limits.
 
 ## Quality gates
 
@@ -154,7 +154,7 @@ Do not commit `.env`, API keys, GitHub tokens, or generated SQLite databases.
 | `GET` | `/healthz` | None | Process health check |
 | `GET` | `/api/v1/ping` | `API_KEYS` | Client connectivity probe |
 | `GET` | `/embed/v1/repos/{owner}/{repo}/star-history.svg` | None | Public self-contained SVG for README embedding |
-| `GET` | `/api/v1/repos/{owner}/{repo}/star-history` | `API_KEYS` | Calibrated public-repository curve |
+| `GET` | `/api/v1/repos/{owner}/{repo}/star-history` | None | Calibrated public-repository curve |
 | `GET` | `/internal/stats` | `API_KEYS` | Serving scale and cache statistics |
 | `GET` | `/internal/metrics/*` | `API_KEYS` | Aggregated service metrics |
 
@@ -162,7 +162,6 @@ Query the calibrated curve:
 
 ```bash
 curl -fsS \
-  -H 'Authorization: Bearer local-history-client-key' \
   'http://127.0.0.1:5014/api/v1/repos/vinta/awesome-python/star-history?repo_id=21289110&range=all&current_stars=120000'
 ```
 

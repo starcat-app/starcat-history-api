@@ -70,10 +70,12 @@ func FromEnv() (*Service, error) {
 		return nil, err
 	}
 	return New(Options{
-		Port:                   kitenv.OrDefault("PORT", defaultPort),
-		APIKeys:                apiKeys,
-		PublishKeys:            optionalListEnv("PUBLISH_KEYS"),
-		GitHubToken:            strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
+		Port:        kitenv.OrDefault("PORT", defaultPort),
+		APIKeys:     apiKeys,
+		PublishKeys: optionalListEnv("PUBLISH_KEYS"),
+		// GITHUB_TOKENS 支持逗号分隔多 token（provider 轮询分摊限额）；
+		// 单值场景仍兼容 GITHUB_TOKEN。
+		GitHubToken:            firstNonEmptyEnv("GITHUB_TOKENS", "GITHUB_TOKEN"),
 		GitHubEndpoint:         kitenv.OrDefault("GITHUB_API_ENDPOINT", "https://api.github.com"),
 		StoreFile:              envOrDefault("STORE_FILE", defaultStoreFile),
 		RegistryDir:            envOrDefault("REGISTRY_DIR", defaultRegistryDir),
@@ -150,7 +152,9 @@ func New(opt Options) (*Service, error) {
 	// README 的 <img> 请求无法携带 API_KEYS；公开 embed 仅允许固定的 SVG 参数，
 	// handler 内部仍会按 owner/repo 做 GitHub Public 校验和 Serving 历史门禁。
 	mux.Handle("GET /embed/v1/repos/{owner}/{repo}/star-history.svg", http.HandlerFunc(historyHandler.HandleStarHistoryEmbed))
-	mux.Handle("GET /api/v1/repos/{owner}/{repo}/star-history", auth.Wrap(http.HandlerFunc(historyHandler.HandleStarHistory)))
+	// 曲线接口与 SVG embed 同为面向第三方的公开入口：只返回公开仓库的重建
+	// 历史曲线，handler 内部仍有 GitHub Public 校验，因此不再要求 API key。
+	mux.Handle("GET /api/v1/repos/{owner}/{repo}/star-history", http.HandlerFunc(historyHandler.HandleStarHistory))
 	mux.Handle("GET /api/v1/repos/{owner}/{repo}/star-history/events", auth.Wrap(http.HandlerFunc(historyHandler.HandleStarHistoryEvents)))
 	mux.Handle("GET /internal/stats", auth.Wrap(handler.HandleStats(registry)))
 	mux.Handle("GET /internal/metrics/summary", auth.Wrap(http.HandlerFunc(metricsHandler.HandleSummary)))
@@ -221,6 +225,16 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// firstNonEmptyEnv 依次返回第一个非空环境变量；全部为空时返回空串。
+func firstNonEmptyEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func intEnv(key string, fallback int) int {

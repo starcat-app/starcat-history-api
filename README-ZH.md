@@ -58,7 +58,7 @@ brew install --cask starcat
 
 <sub><a href="./README.md">English</a></sub>
 
-starcat-history-api 是面向公开 GitHub 仓库的 Star History 服务。它只做一件事：给定一个公开仓库名，返回该仓库的星标历史——既可以是通过鉴权查询的 JSON 曲线接口，也可以是可直接嵌入公开 README 的自包含 SVG 卡片。
+starcat-history-api 是面向公开 GitHub 仓库的 Star History 服务。它只做一件事：给定一个公开仓库名，返回该仓库的星标历史——既可以是免鉴权查询的 JSON 曲线接口，也可以是可直接嵌入公开 README 的自包含 SVG 卡片。
 
 ## 核心能力
 
@@ -103,7 +103,7 @@ estimatedStars(day) = round(currentStars * cumulativeEvents(day) / totalEvents)
 - Go 1.25+
 - Docker，仅在验证或构建容器镜像时需要
 
-`GITHUB_TOKEN` 可选；未配置时服务运行在 GitHub 匿名限额之下。
+`GITHUB_TOKENS`（逗号分隔多 token 轮换分摊限额）或 `GITHUB_TOKEN`（单值）可选；未配置时服务运行在 GitHub 匿名限额之下。
 
 ## 运行测试
 
@@ -148,7 +148,7 @@ curl -fsS \
 | GET | `/healthz` | 无 | 进程健康检查 |
 | GET | `/api/v1/ping` | `API_KEYS` | 客户端连接检查 |
 | GET | `/embed/v1/repos/{owner}/{repo}/star-history.svg` | 无 | README 可嵌入的公开自包含 SVG |
-| GET | `/api/v1/repos/{owner}/{repo}/star-history` | `API_KEYS` | 查询公开仓库校准曲线 |
+| GET | `/api/v1/repos/{owner}/{repo}/star-history` | 无 | 查询公开仓库校准曲线 |
 | GET | `/internal/stats` | `API_KEYS` | Serving 规模与缓存统计 |
 | GET | `/internal/metrics/*` | `API_KEYS` | 调用统计 |
 
@@ -156,7 +156,6 @@ curl -fsS \
 
 ```bash
 curl -fsS \
-  -H 'Authorization: Bearer local-history-client-key' \
   'http://127.0.0.1:5014/api/v1/repos/vinta/awesome-python/star-history?repo_id=21289110&range=all&current_stars=120000'
 ```
 
@@ -170,14 +169,22 @@ curl -fsS \
 <picture data-starcat-star-history>
   <source
     media="(prefers-color-scheme: dark)"
-    srcset="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=dark&amp;locale=zh">
+    srcset="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=dark&amp;locale=zh">
   <img
-    alt="OWNER/REPO 星标历史"
-    src="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=light&amp;locale=zh">
+    alt="starcat-app/Starcat 星标历史"
+    src="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=light&amp;locale=zh">
 </picture>
 ```
 
+
+
+
+
+
+
 ![20260913173049_57z5NLDX](./docs/images/20260913173049_57z5NLDX.webp)
+
+
 
 
 

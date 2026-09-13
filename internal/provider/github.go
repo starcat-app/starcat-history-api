@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/starcat-app/starcat-api-kit/tokenpool"
 	"github.com/starcat-app/starcat-history-api/internal/model"
 	"github.com/starcat-app/starcat-history-api/internal/serving"
 )
@@ -39,12 +41,15 @@ type StarHistoryProvider interface {
 // GitHubProvider 调用官方 REST API 获取当前 star 数和可见性。
 type GitHubProvider struct {
 	endpoint string
-	token    string
-	client   *http.Client
-	now      func() time.Time
+	// pool 复用 api-kit 的 GitHub PAT 池：quota-aware 选 token、401/5xx 死
+	// token 检测、限流临时禁用。池为空（未配置 token）时所有请求匿名发送。
+	pool   *tokenpool.Pool
+	client *http.Client
+	now    func() time.Time
 }
 
-// NewGitHubProvider 创建带超时的 GitHub Provider。
+// NewGitHubProvider 创建带超时的 GitHub Provider。token 支持逗号分隔的多值
+// （对应 GITHUB_TOKENS 环境变量），空条目会被池自动忽略。
 func NewGitHubProvider(endpoint, token string, client *http.Client) *GitHubProvider {
 	if strings.TrimSpace(endpoint) == "" {
 		endpoint = "https://api.github.com"
@@ -52,7 +57,47 @@ func NewGitHubProvider(endpoint, token string, client *http.Client) *GitHubProvi
 	if client == nil {
 		client = &http.Client{Timeout: 8 * time.Second}
 	}
-	return &GitHubProvider{endpoint: strings.TrimRight(endpoint, "/"), token: strings.TrimSpace(token), client: client, now: time.Now}
+	return &GitHubProvider{
+		endpoint: strings.TrimRight(endpoint, "/"),
+		pool:     tokenpool.New(strings.Split(token, ",")),
+		client:   client,
+		now:      time.Now,
+	}
+}
+
+// applyAuth 从池中选 token 写入 Authorization；返回 nil 表示匿名请求
+// （未配置 token）或池耗尽（已带 ErrRateLimited）。
+func (p *GitHubProvider) applyAuth(request *http.Request) (*tokenpool.TokenState, error) {
+	if p.pool.Count() == 0 {
+		return nil, nil
+	}
+	token := p.pool.PickBest()
+	if token == nil {
+		return nil, ErrRateLimited
+	}
+	request.Header.Set("Authorization", "Bearer "+token.Value)
+	return token, nil
+}
+
+// handleRateLimited 在 403/429 时把该 token 按 Retry-After / reset 临时禁用，
+// 与 api-kit 各服务的处理保持一致；匿名请求（token == nil）无需禁用。
+func (p *GitHubProvider) handleRateLimited(token *tokenpool.TokenState, resp *http.Response) {
+	if token == nil {
+		return
+	}
+	pauseUntil := token.ResetAt
+	if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+		if secs, err := strconv.Atoi(retryAfter); err == nil && secs > 0 {
+			if ra := time.Now().Add(time.Duration(secs) * time.Second); ra.After(pauseUntil) {
+				pauseUntil = ra
+			}
+		}
+	}
+	if pauseUntil.Before(time.Now().Add(60 * time.Second)) {
+		pauseUntil = time.Now().Add(60 * time.Second)
+	}
+	log.Printf("[github] rate limited (%d), disabling token until %s", resp.StatusCode, pauseUntil.Format(time.RFC3339))
+	p.pool.DisableUntil(token, pauseUntil, fmt.Sprintf("rate limited status %d", resp.StatusCode))
 }
 
 // Fetch 获取公开仓库元数据。repo_id 最终仍由 handler 与 Serving 数据核对。
@@ -65,19 +110,24 @@ func (p *GitHubProvider) Fetch(ctx context.Context, owner, repo string) (serving
 	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	request.Header.Set("User-Agent", "starcat-history-api")
-	if p.token != "" {
-		request.Header.Set("Authorization", "Bearer "+p.token)
+	poolToken, authErr := p.applyAuth(request)
+	if authErr != nil {
+		return serving.RepositoryMetadata{}, authErr
 	}
 	response, err := p.client.Do(request)
 	if err != nil {
 		return serving.RepositoryMetadata{}, err
 	}
 	defer response.Body.Close()
-	if response.StatusCode == http.StatusNotFound {
-		return serving.RepositoryMetadata{}, ErrNotFound
+	if poolToken != nil {
+		p.pool.UpdateFromResponse(poolToken, response)
 	}
 	if response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusTooManyRequests {
+		p.handleRateLimited(poolToken, response)
 		return serving.RepositoryMetadata{}, ErrRateLimited
+	}
+	if response.StatusCode == http.StatusNotFound {
+		return serving.RepositoryMetadata{}, ErrNotFound
 	}
 	if response.StatusCode != http.StatusOK {
 		return serving.RepositoryMetadata{}, fmt.Errorf("github returned status %d", response.StatusCode)
@@ -143,14 +193,18 @@ func (p *GitHubProvider) StarHistory(ctx context.Context, owner, repo string, pa
 	if ifNoneMatch != "" {
 		request.Header.Set("If-None-Match", ifNoneMatch)
 	}
-	if p.token != "" {
-		request.Header.Set("Authorization", "Bearer "+p.token)
+	poolToken, authErr := p.applyAuth(request)
+	if authErr != nil {
+		return model.GitHubStarHistoryWeekResponse{}, authErr
 	}
 	response, err := p.client.Do(request)
 	if err != nil {
 		return model.GitHubStarHistoryWeekResponse{}, err
 	}
 	defer response.Body.Close()
+	if poolToken != nil {
+		p.pool.UpdateFromResponse(poolToken, response)
+	}
 	if response.StatusCode == http.StatusNotModified {
 		return model.GitHubStarHistoryWeekResponse{NotModified: true, ResponseETag: response.Header.Get("ETag")}, nil
 	}
@@ -158,6 +212,7 @@ func (p *GitHubProvider) StarHistory(ctx context.Context, owner, repo string, pa
 		return model.GitHubStarHistoryWeekResponse{}, ErrNotFound
 	}
 	if response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusTooManyRequests {
+		p.handleRateLimited(poolToken, response)
 		return model.GitHubStarHistoryWeekResponse{}, ErrRateLimited
 	}
 	if response.StatusCode != http.StatusOK {
