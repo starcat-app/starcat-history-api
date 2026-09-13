@@ -165,36 +165,42 @@ The curve endpoint supports `range=3m|1y|all`, `ETag`, and `If-None-Match`. `rep
 The public SVG endpoint does not require an API key. Copy the following HTML into a public repository README (do not wrap it in a code block), then replace `OWNER` and `REPO`:
 
 ```html
-<picture data-starcat-star-history>
-  <source
-    media="(prefers-color-scheme: dark)"
-    srcset="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=dark&amp;locale=en">
-  <img
-    alt="OWNER/REPO Star History"
-    src="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=light&amp;locale=en">
-</picture>
+<a href="https://github.com/starcat-app/Starcat" target="_blank" rel="noopener noreferrer">
+  <picture data-starcat-star-history>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=dark&amp;locale=en">
+    <img
+      alt="OWNER/REPO Star History"
+      src="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=light&amp;locale=en">
+  </picture>
+</a>
 ```
 
 For example, the card below:
 ```
-<picture data-starcat-star-history>
-  <source
-    media="(prefers-color-scheme: dark)"
-    srcset="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=dark&amp;locale=en">
-  <img
-    alt="starcat-app/Starcat Star History"
-    src="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=light&amp;locale=en">
-</picture>
+<a href="https://github.com/starcat-app/Starcat" target="_blank" rel="noopener noreferrer">
+  <picture data-starcat-star-history>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=dark&amp;locale=en">
+    <img
+      alt="starcat-app/Starcat Star History"
+      src="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=light&amp;locale=en">
+  </picture>
+</a>
 ```
 
-<picture data-starcat-star-history>
-  <source
-    media="(prefers-color-scheme: dark)"
-    srcset="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=dark&amp;locale=en">
-  <img
-    alt="starcat-app/Starcat Star History"
-    src="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=light&amp;locale=en">
-</picture>
+<a href="https://github.com/starcat-app/Starcat" target="_blank" rel="noopener noreferrer">
+  <picture data-starcat-star-history>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=dark&amp;locale=en">
+    <img
+      alt="starcat-app/Starcat Star History"
+      src="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=light&amp;locale=en">
+  </picture>
+</a>
 
 The endpoint accepts only `theme=light|dark` and `locale=en|zh`, verifies that the repository is public, and returns a cacheable SVG without JavaScript, remote styles, or remote images. A repository must have at least two history points from the official endpoint before an image is available.
 

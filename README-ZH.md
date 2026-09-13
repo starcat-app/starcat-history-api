@@ -166,36 +166,43 @@ curl -fsS \
 公开 SVG 接口不需要 API key。将下面的 HTML 复制到公开仓库的 README （不要添加代码块标签），并替换 `OWNER` 和 `REPO`：
 
 ```html
-<picture data-starcat-star-history>
-  <source
-    media="(prefers-color-scheme: dark)"
-    srcset="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=dark&amp;locale=en">
-  <img
-    alt="OWNER/REPO Star History"
-    src="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=light&amp;locale=en">
-</picture>
+<a href="https://github.com/starcat-app/Starcat" target="_blank" rel="noopener noreferrer">
+  <picture data-starcat-star-history>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=dark&amp;locale=en">
+    <img
+      alt="OWNER/REPO Star History"
+      src="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=light&amp;locale=en">
+  </picture>
+</a>
 ```
 
 比如下面的卡片：
 ```
-<picture data-starcat-star-history>
-  <source
-    media="(prefers-color-scheme: dark)"
-    srcset="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=dark&amp;locale=zh">
-  <img
-    alt="starcat-app/Starcat 星标历史"
-    src="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=light&amp;locale=zh">
-</picture>
+<a href="https://github.com/starcat-app/Starcat" target="_blank" rel="noopener noreferrer">
+  <picture data-starcat-star-history>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=dark&amp;locale=zh">
+    <img
+      alt="starcat-app/Starcat 星标历史"
+      src="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=light&amp;locale=zh">
+  </picture>
+</a>
 ```
 
-<picture data-starcat-star-history>
-  <source
-    media="(prefers-color-scheme: dark)"
-    srcset="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=dark&amp;locale=zh">
-  <img
-    alt="starcat-app/Starcat 星标历史"
-    src="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=light&amp;locale=zh">
-</picture>
+<a href="https://github.com/starcat-app/Starcat" target="_blank" rel="noopener noreferrer">
+
+  <picture data-starcat-star-history>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=dark&amp;locale=zh">
+    <img
+      alt="starcat-app/Starcat 星标历史"
+      src="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=light&amp;locale=zh">
+  </picture>
+</a>
 
 接口只接受 `theme=light|dark` 和 `locale=en|zh`，会验证仓库必须为公开仓库，并返回不依赖 JavaScript、远程样式或远程图片的可缓存 SVG。官方接口至少返回两个历史点后才会生成图片。
 
