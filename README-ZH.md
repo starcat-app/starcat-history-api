@@ -163,9 +163,21 @@ curl -fsS \
 
 ### 在公开 README 中嵌入星标历史
 
-公开 SVG 接口不需要 API key。将下面的 HTML 复制到公开仓库的 README，并替换 `OWNER` 和 `REPO`：
+公开 SVG 接口不需要 API key。将下面的 HTML 复制到公开仓库的 README （不要添加代码块标签），并替换 `OWNER` 和 `REPO`：
 
 ```html
+<picture data-starcat-star-history>
+  <source
+    media="(prefers-color-scheme: dark)"
+    srcset="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=dark&amp;locale=en">
+  <img
+    alt="OWNER/REPO Star History"
+    src="https://history.starcat.ink/embed/v1/repos/OWNER/REPO/star-history.svg?theme=light&amp;locale=en">
+</picture>
+```
+
+比如下面的卡片：
+```
 <picture data-starcat-star-history>
   <source
     media="(prefers-color-scheme: dark)"
@@ -176,17 +188,14 @@ curl -fsS \
 </picture>
 ```
 
-
-
-
-
-
-
-![20260913173049_57z5NLDX](./docs/images/20260913173049_57z5NLDX.webp)
-
-
-
-
+<picture data-starcat-star-history>
+  <source
+    media="(prefers-color-scheme: dark)"
+    srcset="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=dark&amp;locale=zh">
+  <img
+    alt="starcat-app/Starcat 星标历史"
+    src="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=light&amp;locale=zh">
+</picture>
 
 接口只接受 `theme=light|dark` 和 `locale=en|zh`，会验证仓库必须为公开仓库，并返回不依赖 JavaScript、远程样式或远程图片的可缓存 SVG。官方接口至少返回两个历史点后才会生成图片。
 
@@ -204,12 +213,7 @@ curl -fsS \
 
 - 服务不保存 GitHub 身份、actor、事件 payload、Starcat 用户数据或私有/内部仓库数据。
 - 服务不连接 BigQuery，也不读取任何本地 Raw 数据湖。
-- GitHub Token 仅用于读取公开仓库当前 metadata 和官方公开 Star 历史；未配置时受 GitHub 匿名限额约束。
 - 安全漏洞请通过 GitHub Security Advisories 私密报告，见 [SECURITY.md](./SECURITY.md)。
-
-## 聚合部署
-
-生产环境作为 `starcat-api` 的第七个模块运行，通过 `X-SC-Svc: history` 分流；无需新增独立 Fly App。独立二进制与 Dockerfile 仍保留，方便本地验证和第三方自托管。
 
 ## License
 

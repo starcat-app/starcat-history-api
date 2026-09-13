@@ -116,13 +116,6 @@ go test ./...
 go vet ./...
 ```
 
-Build the API binary or container:
-
-```bash
-make build
-docker build -t starcat-history-api:local .
-```
-
 ## Run the API locally
 
 ```bash
@@ -169,7 +162,7 @@ The curve endpoint supports `range=3m|1y|all`, `ETag`, and `If-None-Match`. `rep
 
 ### Embed Star History in a public README
 
-The public SVG endpoint does not require an API key. Copy the following HTML into a public repository README, then replace `OWNER` and `REPO`:
+The public SVG endpoint does not require an API key. Copy the following HTML into a public repository README (do not wrap it in a code block), then replace `OWNER` and `REPO`:
 
 ```html
 <picture data-starcat-star-history>
@@ -182,7 +175,26 @@ The public SVG endpoint does not require an API key. Copy the following HTML int
 </picture>
 ```
 
-![Star History SVG card rendered by starcat-history-api](./docs/images/20260913173049_57z5NLDX.webp)
+For example, the card below:
+```
+<picture data-starcat-star-history>
+  <source
+    media="(prefers-color-scheme: dark)"
+    srcset="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=dark&amp;locale=en">
+  <img
+    alt="starcat-app/Starcat Star History"
+    src="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=light&amp;locale=en">
+</picture>
+```
+
+<picture data-starcat-star-history>
+  <source
+    media="(prefers-color-scheme: dark)"
+    srcset="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=dark&amp;locale=en">
+  <img
+    alt="starcat-app/Starcat Star History"
+    src="https://history.starcat.ink/embed/v1/repos/starcat-app/Starcat/star-history.svg?theme=light&amp;locale=en">
+</picture>
 
 The endpoint accepts only `theme=light|dark` and `locale=en|zh`, verifies that the repository is public, and returns a cacheable SVG without JavaScript, remote styles, or remote images. A repository must have at least two history points from the official endpoint before an image is available.
 
@@ -199,13 +211,8 @@ For local testing, replace the host with `http://127.0.0.1:5014`. A localhost UR
 ## Security and privacy boundary
 
 - The service never stores GitHub identities, actors, event payloads, Starcat user data, or private/internal repository data.
-- It never connects to BigQuery or a private home network and never reads any local Raw data lake.
 - GitHub tokens, when configured, are used to read current public repository metadata and the official public Star history endpoint.
 - Vulnerabilities should be reported privately through GitHub Security Advisories, as described in [SECURITY.md](./SECURITY.md).
-
-## Deployment boundary
-
-Starcat production runs History as a module behind `starcat-api`, selected with `X-SC-Svc: history`; it does not require a dedicated Fly app. The standalone binary and Dockerfile remain supported for local validation and self-hosted deployments.
 
 ## Contributing
 
