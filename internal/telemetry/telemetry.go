@@ -20,6 +20,7 @@ type Registry struct {
 	githubHistory     atomic.Int64
 	githubAvatar      atomic.Int64
 	githubRateLimited atomic.Int64
+	limiterTimeouts   atomic.Int64
 
 	metadataCacheHits    atomic.Int64
 	metadataCacheMisses  atomic.Int64
@@ -39,6 +40,7 @@ type Snapshot struct {
 	GitHubHistoryRequests  int64 `json:"github_history_requests"`
 	GitHubAvatarRequests   int64 `json:"github_avatar_requests"`
 	GitHubRateLimited      int64 `json:"github_rate_limited"`
+	LimiterTimeouts        int64 `json:"limiter_timeouts"`
 
 	MetadataCacheHits    int64 `json:"metadata_cache_hits"`
 	MetadataCacheMisses  int64 `json:"metadata_cache_misses"`
@@ -59,6 +61,7 @@ func (r *Registry) Snapshot() Snapshot {
 		GitHubHistoryRequests:  r.githubHistory.Load(),
 		GitHubAvatarRequests:   r.githubAvatar.Load(),
 		GitHubRateLimited:      r.githubRateLimited.Load(),
+		LimiterTimeouts:        r.limiterTimeouts.Load(),
 		MetadataCacheHits:      r.metadataCacheHits.Load(),
 		MetadataCacheMisses:    r.metadataCacheMisses.Load(),
 		MetadataNegativeHits:   r.metadataNegativeHits.Load(),
@@ -77,6 +80,7 @@ func (r *Registry) Reset() {
 	}
 	for _, counter := range []*atomic.Int64{
 		&r.githubMetadata, &r.githubHistory, &r.githubAvatar, &r.githubRateLimited,
+		&r.limiterTimeouts,
 		&r.metadataCacheHits, &r.metadataCacheMisses, &r.metadataNegativeHits,
 		&r.historyCacheHits, &r.historyCacheMisses, &r.historyStaleServed,
 	} {
@@ -114,6 +118,14 @@ func (r *Registry) RateLimited() {
 		return
 	}
 	r.githubRateLimited.Add(1)
+}
+
+// LimiterTimeout 记录一次"全局出站闸门饱和、排队超时"。
+func (r *Registry) LimiterTimeout() {
+	if r == nil {
+		return
+	}
+	r.limiterTimeouts.Add(1)
 }
 
 // MetadataCacheHit 记录一次 metadata 命中持久缓存、未回源 GitHub。

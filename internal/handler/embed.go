@@ -153,7 +153,7 @@ func writeEmbedMetadataError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, provider.ErrNotFound):
 		writeError(w, http.StatusNotFound, "REPOSITORY_NOT_FOUND", "Public repository history is not available.", nil)
-	case errors.Is(err, provider.ErrRateLimited):
+	case isUpstreamBusy(err):
 		w.Header().Set("Retry-After", "60")
 		writeError(w, http.StatusTooManyRequests, "GITHUB_RATE_LIMITED", "GitHub metadata is temporarily unavailable.", nil)
 	default:

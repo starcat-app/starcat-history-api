@@ -70,6 +70,15 @@ type GitHubProvider struct {
 	telemetry *telemetry.Registry
 	// avatarCache 可为 nil：未装配时退化为"每次都尝试下载"，不改变对外行为。
 	avatarCache AvatarCache
+	// limiter 可为 nil：未装配时不限并发（单测与本地调试）。
+	limiter *callLimiter
+}
+
+// WithConcurrencyLimit 给所有出站 GitHub 调用加全局并发上限。
+// maxConcurrency <= 0 表示不限并发。
+func (p *GitHubProvider) WithConcurrencyLimit(maxConcurrency int) *GitHubProvider {
+	p.limiter = newCallLimiter(maxConcurrency, defaultCallAcquireTimeout, p.telemetry)
+	return p
 }
 
 // WithTelemetry 注入计数指标；返回自身便于在装配处链式调用。
@@ -151,6 +160,11 @@ func (p *GitHubProvider) Fetch(ctx context.Context, owner, repo string) (serving
 	if authErr != nil {
 		return serving.RepositoryMetadata{}, authErr
 	}
+	release, err := p.limiter.acquire(ctx)
+	if err != nil {
+		return serving.RepositoryMetadata{}, err
+	}
+	defer release()
 	// 计数放在真正发请求之前：这里统计的是「对外产生了多少次 GitHub 调用」，
 	// 失败也要计，否则限流期间的调用量会被低估。
 	p.telemetry.MetadataRequested()
@@ -237,6 +251,11 @@ func (p *GitHubProvider) StarHistory(ctx context.Context, owner, repo string, pa
 	if authErr != nil {
 		return model.GitHubStarHistoryWeekResponse{}, authErr
 	}
+	release, err := p.limiter.acquire(ctx)
+	if err != nil {
+		return model.GitHubStarHistoryWeekResponse{}, err
+	}
+	defer release()
 	p.telemetry.HistoryRequested()
 	response, err := p.client.Do(request)
 	if err != nil {
@@ -341,6 +360,11 @@ func (p *GitHubProvider) fetchAvatarDataURI(ctx context.Context, rawURL string) 
 	}
 	request.Header.Set("Accept", "image/png,image/jpeg,image/webp,image/gif")
 	request.Header.Set("User-Agent", "starcat-history-api")
+	release, err := p.limiter.acquire(fetchCtx)
+	if err != nil {
+		return ""
+	}
+	defer release()
 	p.telemetry.AvatarRequested()
 	response, err := p.client.Do(request)
 	if err != nil {

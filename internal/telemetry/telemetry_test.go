@@ -9,6 +9,7 @@ func TestSnapshotCountsEveryCategoryIndependently(t *testing.T) {
 	registry.HistoryRequested()
 	registry.AvatarRequested()
 	registry.RateLimited()
+	registry.LimiterTimeout()
 	registry.MetadataCacheHit()
 	registry.MetadataCacheMiss()
 	registry.MetadataNegativeHit()
@@ -22,6 +23,7 @@ func TestSnapshotCountsEveryCategoryIndependently(t *testing.T) {
 		GitHubHistoryRequests:  1,
 		GitHubAvatarRequests:   1,
 		GitHubRateLimited:      1,
+		LimiterTimeouts:        1,
 		MetadataCacheHits:      1,
 		MetadataCacheMisses:    1,
 		MetadataNegativeHits:   1,
@@ -42,6 +44,7 @@ func TestResetClearsEveryCounter(t *testing.T) {
 	registry.HistoryRequested()
 	registry.AvatarRequested()
 	registry.RateLimited()
+	registry.LimiterTimeout()
 	registry.MetadataCacheHit()
 	registry.MetadataCacheMiss()
 	registry.MetadataNegativeHit()
@@ -63,6 +66,7 @@ func TestNilRegistryIsSafe(t *testing.T) {
 	registry.HistoryRequested()
 	registry.AvatarRequested()
 	registry.RateLimited()
+	registry.LimiterTimeout()
 	registry.MetadataCacheHit()
 	registry.MetadataCacheMiss()
 	registry.MetadataNegativeHit()

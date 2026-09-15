@@ -426,7 +426,7 @@ func (h *HistoryHandler) writeOfficialHistoryError(w http.ResponseWriter, err er
 	switch {
 	case errors.Is(err, provider.ErrNotFound):
 		writeError(w, http.StatusNotFound, "HISTORY_NOT_FOUND", "Star history is not available for this repository.", nil)
-	case errors.Is(err, provider.ErrRateLimited):
+	case isUpstreamBusy(err):
 		w.Header().Set("Retry-After", "60")
 		writeError(w, http.StatusTooManyRequests, "GITHUB_RATE_LIMITED", "GitHub star history is temporarily unavailable.", nil)
 	default:

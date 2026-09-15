@@ -138,6 +138,7 @@ make run
 | `METADATA_TTL_SECONDS` | `86400` | 缓存的仓库元数据（星标、简介、主题）保持新鲜多久 |
 | `METADATA_NEGATIVE_CACHE_TTL_SECONDS` | `3600` | 不存在或非公开的仓库被记住"不可用"多久 |
 | `OFFICIAL_MEMORY_CACHE_TTL_SECONDS` | `1800` | 官方周数据在进程内的副本时长 |
+| `GITHUB_MAX_CONCURRENCY` | `8` | 全局出站 GitHub 并发上限；饱和时回退到缓存或 `stale` |
 
 头像按 owner URL 只下载一次并复用 30 天，固定取 CDN 的小尺寸变体（`s=128`），上限 64KB。
 完整头像约 300KB、在部分网络环境要 9 秒以上（超过请求超时），因此永不请求。

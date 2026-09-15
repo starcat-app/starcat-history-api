@@ -329,7 +329,7 @@ func (h *HistoryHandler) requirePublicMetadata(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusNotFound, "REPOSITORY_NOT_FOUND", "Repository was not found.", nil)
 		return serving.RepositoryMetadata{}, false
 	}
-	if errors.Is(err, provider.ErrRateLimited) {
+	if isUpstreamBusy(err) {
 		w.Header().Set("Retry-After", "60")
 		writeError(w, http.StatusTooManyRequests, "GITHUB_RATE_LIMITED", "GitHub metadata is temporarily unavailable.", nil)
 		return serving.RepositoryMetadata{}, false

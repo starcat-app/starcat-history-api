@@ -25,9 +25,14 @@ import (
 )
 
 const (
-	defaultPort        = "5014"
-	defaultRegistryDir = "./data/history-registry"
-	defaultStoreFile   = "./data/history.sqlite"
+	defaultPort = "5014"
+	// defaultGitHubMaxConcurrency 是全局出站闸门的默认并发上限。
+	// 8 的取舍：并发冷启动（多个仓库的 README 同时首次被访问）时，单仓库分页会占 4 个
+	// 槽位，8 允许两三个仓库同时推进；再高就容易踩 GitHub 的二级限流，反而让整池 token
+	// 被禁几分钟。饱和时请求排队，超时后回退到缓存或 stale 数据。
+	defaultGitHubMaxConcurrency = 8
+	defaultRegistryDir          = "./data/history-registry"
+	defaultStoreFile            = "./data/history.sqlite"
 	// 全量 4000 万级仓库快照可能超过 2 GiB，默认上限保留到 16 GiB；
 	// 实际 Fly 卷容量与上传窗口仍由运维侧单独控制。
 	defaultMaxBundleBytes    = int64(16 << 30)
@@ -47,6 +52,7 @@ type Options struct {
 	MetadataTTL            time.Duration
 	OfficialMemoryCacheTTL time.Duration
 	NegativeCacheTTL       time.Duration
+	GitHubMaxConcurrency   int
 	MaximumPoints          int
 	MaxBundleBytes         int64
 	SnapshotRetention      int
@@ -85,6 +91,7 @@ func FromEnv() (*Service, error) {
 		MetadataTTL:            kitenv.DurationSeconds("METADATA_TTL_SECONDS", 24*time.Hour),
 		OfficialMemoryCacheTTL: kitenv.DurationSeconds("OFFICIAL_MEMORY_CACHE_TTL_SECONDS", handler.DefaultOfficialMemoryCacheTTL),
 		NegativeCacheTTL:       kitenv.DurationSeconds("METADATA_NEGATIVE_CACHE_TTL_SECONDS", handler.DefaultNegativeMetadataCacheTTL),
+		GitHubMaxConcurrency:   intEnv("GITHUB_MAX_CONCURRENCY", defaultGitHubMaxConcurrency),
 		MaximumPoints:          intEnv("MAXIMUM_HISTORY_POINTS", series.DefaultMaximumPoints),
 		MaxBundleBytes:         int64Env("MAX_BUNDLE_BYTES", defaultMaxBundleBytes),
 		SnapshotRetention:      intEnv("SNAPSHOT_RETENTION", defaultSnapshotRetention),
@@ -147,7 +154,9 @@ func New(opt Options) (*Service, error) {
 	metadataProvider := provider.NewGitHubProvider(opt.GitHubEndpoint, opt.GitHubToken, nil).
 		WithTelemetry(serviceTelemetry).
 		// 头像按 URL 复用同一份 SQLite：它几乎不变，不该跟着元数据 TTL 每次重下。
-		WithAvatarCache(registry)
+		WithAvatarCache(registry).
+		// 所有出站 GitHub 调用（metadata / 分页 / 头像）共用一道全局闸门。
+		WithConcurrencyLimit(opt.GitHubMaxConcurrency)
 	// 历史曲线与仓库 metadata 共用 GitHub client，但数据源明确切换到官方
 	// stargazers/history；旧 repo_history_series 仅继续服务 /events 调试接口。
 	historyHandler := handler.NewHistoryHandler(
