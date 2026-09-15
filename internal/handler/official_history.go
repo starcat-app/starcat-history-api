@@ -142,7 +142,7 @@ func (h *HistoryHandler) handleOfficialStarHistoryEmbed(w http.ResponseWriter, r
 	}
 	etag := officialEmbedETag(owner, repo, metadata.RepoID, metadata.CurrentStars, cached, theme, locale)
 	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800")
+	w.Header().Set("Cache-Control", embedCacheControl)
 	w.Header().Set("ETag", etag)
 	if r.Header.Get("If-None-Match") == etag {
 		w.WriteHeader(http.StatusNotModified)

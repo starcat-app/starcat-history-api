@@ -15,6 +15,21 @@ import (
 	"github.com/starcat-app/starcat-history-api/internal/serving"
 )
 
+// embedCacheControl 是 SVG 嵌入响应唯一的缓存策略来源，两条分支（Serving 自研
+// 曲线与 GitHub 官方历史）必须共用同一个值，否则同一张 README 图会因走哪条分支
+// 而出现不同的新鲜度。
+//
+// 分层口径：浏览器 1 小时；Camo 等共享缓存 1 天；过期后允许先画旧图、后台再验证。
+//
+// stale-while-revalidate 故意只给 1 小时，不给更长的窗口：README 卡片上最显眼的
+// 是「Total Stars」，浏览器冷加载时会先把过期副本画出来再后台换新，窗口开得越大
+// 用户看到旧星标数的时间就越长（7 天窗口曾造成线上卡片显示两天前的星标数）。
+// 1 小时仍能在源站被 GitHub 限流或重启时提供兜底。
+//
+// 约束：这里必须保持唯一写入者。Nginx 侧不得再用 add_header 追加第二个
+// Cache-Control —— add_header 是追加而非覆盖，两个 max-age 并存属于未定义行为。
+const embedCacheControl = "public, max-age=3600, s-maxage=86400, stale-while-revalidate=3600"
+
 // HandleStarHistoryEmbed 处理公开 README 图片请求：
 // GET /embed/v1/repos/{owner}/{repo}/star-history.svg
 //
@@ -95,7 +110,7 @@ func (h *HistoryHandler) HandleStarHistoryEmbed(w http.ResponseWriter, r *http.R
 
 	etag := embedETag(metadata.RepoID, metadata.CurrentStars, storedSeries.SeriesChecksum, active, theme, locale)
 	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800")
+	w.Header().Set("Cache-Control", embedCacheControl)
 	w.Header().Set("ETag", etag)
 	if r.Header.Get("If-None-Match") == etag {
 		w.WriteHeader(http.StatusNotModified)

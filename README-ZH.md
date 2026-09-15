@@ -206,6 +206,8 @@ curl -fsS \
 
 接口只接受 `theme=light|dark` 和 `locale=en|zh`，会验证仓库必须为公开仓库，并返回不依赖 JavaScript、远程样式或远程图片的可缓存 SVG。官方接口至少返回两个历史点后才会生成图片。
 
+SVG 响应头为 `Cache-Control: public, max-age=3600, s-maxage=86400, stale-while-revalidate=3600` 并附带 `ETag`。因此一张已渲染的卡片在客户端最多落后一小时，在 GitHub Camo 这类共享缓存上最多落后一天。卡片上的星标总数取自仓库 metadata 缓存（默认 24 小时），不是从曲线本身推导，所以最多可能落后该时长。带上 `If-None-Match` 可在数据未变时拿到 `304`。
+
 HTML 属性中的查询参数使用 `&amp;`，命令行 URL 使用普通 `&`。例如，直接获取 SVG 文件：
 
 ```bash

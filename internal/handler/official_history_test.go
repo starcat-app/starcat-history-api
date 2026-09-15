@@ -135,3 +135,55 @@ func TestOfficialMemoryCacheTTLIsConfigurable(t *testing.T) {
 		t.Fatalf("invalid memory cache TTL must keep the default: %s", invalidHandler.officialMemoryCacheTTL)
 	}
 }
+
+// 官方历史分支与 Serving 分支是同一个公开图片地址的两条实现路径，缓存策略必须
+// 完全一致：否则同一张 README 卡片会因为部署形态不同而出现不同的新鲜度，用户
+// 看到的星标数也会随之漂移。
+func TestOfficialHistoryEmbedUsesSharedCachePolicy(t *testing.T) {
+	store, err := serving.Open(t.TempDir() + "/history.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	now := time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC)
+	metadata := serving.RepositoryMetadata{
+		RepoID: 42, FullName: "owner/repo", Visibility: "public", CurrentStars: 100, CheckedAt: now,
+	}
+	if err := store.SaveMetadata(context.Background(), metadata); err != nil {
+		t.Fatal(err)
+	}
+	starHistory := &fakeStarHistoryProvider{page: func(page int, _ string) model.GitHubStarHistoryWeekResponse {
+		if page == 1 {
+			return model.GitHubStarHistoryWeekResponse{
+				Weeks: []model.GitHubStarHistoryWeek{
+					{Week: 1_725_696_000, Total: 3, Days: []int{1, 0, 2, 0, 0, 0, 0}},
+					{Week: 1_725_091_200, Total: 1, Days: []int{0, 1, 0, 0, 0, 0, 0}},
+				}, ResponseETag: `"history-v1"`,
+			}
+		}
+		return model.GitHubStarHistoryWeekResponse{}
+	}}
+	handler := NewHistoryHandler(store, &fakeMetadataProvider{value: metadata}, time.Hour, 400, WithStarHistoryProvider(starHistory))
+	handler.now = func() time.Time { return now }
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /embed/v1/repos/{owner}/{repo}/star-history.svg", handler.HandleStarHistoryEmbed)
+
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/embed/v1/repos/owner/repo/star-history.svg?theme=light&locale=en", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Content-Type") != "image/svg+xml; charset=utf-8" {
+		t.Fatalf("unexpected content type %q", response.Header().Get("Content-Type"))
+	}
+	if got := response.Header().Get("Cache-Control"); got != embedCacheControl {
+		t.Fatalf("official embed must reuse the shared cache policy, got %q", got)
+	}
+	if values := response.Header().Values("Cache-Control"); len(values) != 1 {
+		t.Fatalf("official embed response must carry exactly one Cache-Control value, got %v", values)
+	}
+	// 没有这一步，Serving 分支的兜底实现也能让断言通过，守卫就是假的。
+	if starHistory.pages.Load() == 0 {
+		t.Fatal("official history provider was never called, embed did not exercise the official branch")
+	}
+}
