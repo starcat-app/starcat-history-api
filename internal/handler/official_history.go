@@ -89,7 +89,7 @@ func (h *HistoryHandler) handleOfficialStarHistory(w http.ResponseWriter, r *htt
 	etag := officialHistoryETag(owner, repo, repoID, currentStars, historyRange, cached)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "private, max-age=3600")
-	if r.Header.Get("If-None-Match") == etag {
+	if ifNoneMatch(r.Header.Get("If-None-Match"), etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -144,7 +144,7 @@ func (h *HistoryHandler) handleOfficialStarHistoryEmbed(w http.ResponseWriter, r
 	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
 	w.Header().Set("Cache-Control", embedCacheControl)
 	w.Header().Set("ETag", etag)
-	if r.Header.Get("If-None-Match") == etag {
+	if ifNoneMatch(r.Header.Get("If-None-Match"), etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}

@@ -197,7 +197,7 @@ func (h *HistoryHandler) HandleStarHistory(w http.ResponseWriter, r *http.Reques
 	etag := historyETag(repoID, historyRange, currentStars, storedSeries.SeriesChecksum, active)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "private, max-age=3600")
-	if r.Header.Get("If-None-Match") == etag {
+	if ifNoneMatch(r.Header.Get("If-None-Match"), etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -252,7 +252,7 @@ func (h *HistoryHandler) HandleStarHistoryEvents(w http.ResponseWriter, r *http.
 	etag := eventsETag(repoID, storedSeries.SeriesChecksum, active)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "private, max-age=3600")
-	if r.Header.Get("If-None-Match") == etag {
+	if ifNoneMatch(r.Header.Get("If-None-Match"), etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
