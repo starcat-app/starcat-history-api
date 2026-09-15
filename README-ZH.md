@@ -150,6 +150,8 @@ curl -fsS \
 | GET | `/embed/v1/repos/{owner}/{repo}/star-history.svg` | 无 | README 可嵌入的公开自包含 SVG |
 | GET | `/api/v1/repos/{owner}/{repo}/star-history` | 无 | 查询公开仓库校准曲线 |
 | GET | `/internal/stats` | `API_KEYS` | Serving 规模与缓存统计 |
+| GET | `/internal/metrics/service` | `API_KEYS` | 进程内计数：GitHub 回源次数、缓存命中、stale 兜底 |
+| POST | `/internal/metrics/service/reset` | `API_KEYS` | 计数归零（压测脚本取差值用） |
 | GET | `/internal/metrics/*` | `API_KEYS` | 调用统计 |
 
 查询校准曲线：

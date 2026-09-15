@@ -17,6 +17,7 @@ import (
 	"github.com/starcat-app/starcat-history-api/internal/provider"
 	"github.com/starcat-app/starcat-history-api/internal/series"
 	"github.com/starcat-app/starcat-history-api/internal/serving"
+	"github.com/starcat-app/starcat-history-api/internal/telemetry"
 )
 
 var repositoryPathPart = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
@@ -56,6 +57,11 @@ func WithOfficialMemoryCacheTTL(value time.Duration) HistoryHandlerOption {
 	}
 }
 
+// WithTelemetry 注入进程内计数指标，用于观测缓存命中与回源次数。
+func WithTelemetry(registry *telemetry.Registry) HistoryHandlerOption {
+	return func(h *HistoryHandler) { h.telemetry = registry }
+}
+
 // HistoryHandler 生成客户端兼容响应；生产配置优先使用 GitHub 官方周历史，
 // 旧压缩序列只保留给 /events 原始事件接口和未装配官方 provider 的兼容测试。
 type HistoryHandler struct {
@@ -69,6 +75,8 @@ type HistoryHandler struct {
 	officialMemoryCacheTTL time.Duration
 	maximumPoints          int
 	now                    func() time.Time
+	// telemetry 可为 nil；所有计数都走 nil-safe 方法，单测无需构造。
+	telemetry *telemetry.Registry
 }
 
 // NewHistoryHandler 创建查询 handler。
@@ -324,6 +332,7 @@ func (h *HistoryHandler) resolveMetadata(ctx context.Context, repoID int64, owne
 		return serving.RepositoryMetadata{}, err
 	}
 	if found && h.now().UTC().Sub(cached.CheckedAt) < h.metadataTTL {
+		h.telemetry.MetadataCacheHit()
 		return cached, nil
 	}
 	if h.metadata == nil {
@@ -332,6 +341,7 @@ func (h *HistoryHandler) resolveMetadata(ctx context.Context, repoID int64, owne
 		}
 		return serving.RepositoryMetadata{}, fmt.Errorf("metadata provider is not configured")
 	}
+	h.telemetry.MetadataCacheMiss()
 	fresh, err := h.metadata.Fetch(ctx, owner, repo)
 	if err != nil {
 		// GitHub 临时失败时允许使用已经验证过的旧公开元数据，避免外部依赖拖垮历史接口。
@@ -361,6 +371,7 @@ func (h *HistoryHandler) resolvePublicMetadata(ctx context.Context, owner, repo 
 		return serving.RepositoryMetadata{}, err
 	}
 	if found && h.now().UTC().Sub(cached.CheckedAt) < h.metadataTTL {
+		h.telemetry.MetadataCacheHit()
 		return cached, nil
 	}
 	if h.metadata == nil {
@@ -369,6 +380,7 @@ func (h *HistoryHandler) resolvePublicMetadata(ctx context.Context, owner, repo 
 		}
 		return serving.RepositoryMetadata{}, fmt.Errorf("metadata provider is not configured")
 	}
+	h.telemetry.MetadataCacheMiss()
 	fresh, err := h.metadata.Fetch(ctx, owner, repo)
 	if err != nil {
 		if found && cached.Visibility == "public" {

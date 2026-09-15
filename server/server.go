@@ -20,6 +20,7 @@ import (
 	"github.com/starcat-app/starcat-history-api/internal/provider"
 	"github.com/starcat-app/starcat-history-api/internal/series"
 	"github.com/starcat-app/starcat-history-api/internal/serving"
+	"github.com/starcat-app/starcat-history-api/internal/telemetry"
 	"github.com/starcat-app/starcat-history-api/internal/version"
 )
 
@@ -135,13 +136,17 @@ func New(opt Options) (*Service, error) {
 		registry.Close()
 		return nil, fmt.Errorf("initialize metrics collector: %w", err)
 	}
-	metadataProvider := provider.NewGitHubProvider(opt.GitHubEndpoint, opt.GitHubToken, nil)
+	// 进程内计数：kitmetrics 记录按路由的耗时/状态码，这里记录回源次数与缓存命中，
+	// 两者互补。用于压测取差值，也用于线上判断「慢」是缓存问题还是 GitHub 问题。
+	serviceTelemetry := telemetry.NewRegistry()
+	metadataProvider := provider.NewGitHubProvider(opt.GitHubEndpoint, opt.GitHubToken, nil).WithTelemetry(serviceTelemetry)
 	// 历史曲线与仓库 metadata 共用 GitHub client，但数据源明确切换到官方
 	// stargazers/history；旧 repo_history_series 仅继续服务 /events 调试接口。
 	historyHandler := handler.NewHistoryHandler(
 		registry, metadataProvider, opt.MetadataTTL, opt.MaximumPoints,
 		handler.WithStarHistoryProvider(metadataProvider),
 		handler.WithOfficialMemoryCacheTTL(opt.OfficialMemoryCacheTTL),
+		handler.WithTelemetry(serviceTelemetry),
 	)
 	auth := middleware.NewBearerAuth(opt.APIKeys)
 	metricsHandler := kitmetrics.NewHandler(Name(), metrics.Store())
@@ -161,6 +166,9 @@ func New(opt Options) (*Service, error) {
 	mux.Handle("GET /internal/metrics/timeseries", auth.Wrap(http.HandlerFunc(metricsHandler.HandleTimeseries)))
 	mux.Handle("GET /internal/metrics/routes", auth.Wrap(http.HandlerFunc(metricsHandler.HandleRoutes)))
 	mux.Handle("GET /internal/metrics/status-codes", auth.Wrap(http.HandlerFunc(metricsHandler.HandleStatusCodes)))
+	// 进程内计数：GET 读快照，POST 归零（压测取单场景差值用，因此不能用 GET 清零）。
+	mux.Handle("GET /internal/metrics/service", auth.Wrap(handler.HandleServiceMetrics(serviceTelemetry)))
+	mux.Handle("POST /internal/metrics/service/reset", auth.Wrap(handler.HandleServiceMetricsReset(serviceTelemetry)))
 	if len(opt.PublishKeys) > 0 {
 		publishAuth := middleware.NewBearerAuth(opt.PublishKeys)
 		publishHandler := handler.NewPublishHandler(registry, opt.MaxBundleBytes)
@@ -175,6 +183,7 @@ func New(opt Options) (*Service, error) {
 		log.Printf("  GET /api/v1/repos/{owner}/{repo}/star-history")
 		log.Printf("  GET /api/v1/repos/{owner}/{repo}/star-history/events")
 		log.Printf("  GET /internal/stats")
+		log.Printf("  GET /internal/metrics/service")
 		if len(opt.PublishKeys) > 0 {
 			log.Printf("  POST /internal/v1/history-snapshots/{model_version}")
 			log.Printf("  POST /internal/v1/history-deltas/{delta_id}")

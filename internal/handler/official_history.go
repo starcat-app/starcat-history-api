@@ -166,10 +166,14 @@ func (h *HistoryHandler) loadOfficialHistory(ctx context.Context, owner, repo st
 	key := strings.ToLower(strings.TrimSpace(owner) + "/" + strings.TrimSpace(repo))
 	now := h.now().UTC()
 	if value, ok := h.memory.Get(key, now); ok {
+		h.telemetry.HistoryCacheHit()
 		return value.(model.GitHubStarHistoryCache), nil
 	}
 	returnValue, err := h.flights.Do(ctx, key, func() (any, error) {
 		if value, ok := h.memory.Get(key, h.now().UTC()); ok {
+			// 并发冷启动里后到的请求：虽然走了 singleflight，但它同样没有回源
+			// GitHub，计入命中才能让「命中率」反映真实的回源压力。
+			h.telemetry.HistoryCacheHit()
 			return value, nil
 		}
 		var cached model.GitHubStarHistoryCache
@@ -183,14 +187,17 @@ func (h *HistoryHandler) loadOfficialHistory(ctx context.Context, owner, repo st
 		}
 		now := h.now().UTC()
 		if found && now.Sub(cached.FetchedAt) < officialHistoryCacheTTL {
+			h.telemetry.HistoryCacheHit()
 			h.memory.Set(key, cached, now, h.officialMemoryCacheTTL)
 			return cached, nil
 		}
+		h.telemetry.HistoryCacheMiss()
 		refreshed, err := h.refreshOfficialHistory(ctx, owner, repo, cached, found, now)
 		if err != nil {
 			// 官方 API 临时限流或网络抖动时，已验证的旧曲线比让 README 直接
 			// 失败更有价值。不要推进 DB 的 fetched_at，短暂内存兜底后仍会重试。
 			if found && len(cached.Weeks) > 0 {
+				h.telemetry.HistoryStaleServed()
 				h.memory.Set(key, cached, now, time.Minute)
 				return cached, nil
 			}

@@ -140,6 +140,16 @@ curl -fsS \
 
 Do not commit `.env`, API keys, GitHub tokens, or generated SQLite databases.
 
+Measure the running instance (latency percentiles plus GitHub-call deltas). Pass the server's
+`API_KEYS` value so the script can read `/internal/metrics/service`:
+
+```bash
+scripts/bench-history-api.sh --base http://127.0.0.1:5014 --key "$API_KEY" --cold some-org/some-repo
+```
+
+The `--cold` scenario points at a repository that is not cached yet: it verifies that concurrent
+cold requests collapse into a single GitHub call instead of one call per request.
+
 ## API
 
 | Method | Path | Authentication | Purpose |
@@ -150,6 +160,8 @@ Do not commit `.env`, API keys, GitHub tokens, or generated SQLite databases.
 | `GET` | `/api/v1/repos/{owner}/{repo}/star-history` | None | Calibrated public-repository curve |
 | `GET` | `/internal/stats` | `API_KEYS` | Serving scale and cache statistics |
 | `GET` | `/internal/metrics/*` | `API_KEYS` | Aggregated service metrics |
+| `GET` | `/internal/metrics/service` | `API_KEYS` | In-process counters: GitHub calls, cache hits, stale serves |
+| `POST` | `/internal/metrics/service/reset` | `API_KEYS` | Zero those counters (used by the bench script) |
 
 Query the calibrated curve:
 

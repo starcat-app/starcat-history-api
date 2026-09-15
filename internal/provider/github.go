@@ -18,6 +18,7 @@ import (
 	"github.com/starcat-app/starcat-api-kit/tokenpool"
 	"github.com/starcat-app/starcat-history-api/internal/model"
 	"github.com/starcat-app/starcat-history-api/internal/serving"
+	"github.com/starcat-app/starcat-history-api/internal/telemetry"
 )
 
 var (
@@ -46,6 +47,14 @@ type GitHubProvider struct {
 	pool   *tokenpool.Pool
 	client *http.Client
 	now    func() time.Time
+	// telemetry 可为 nil（测试与未装配埋点的调用方），所有计数都走 nil-safe 方法。
+	telemetry *telemetry.Registry
+}
+
+// WithTelemetry 注入计数指标；返回自身便于在装配处链式调用。
+func (p *GitHubProvider) WithTelemetry(registry *telemetry.Registry) *GitHubProvider {
+	p.telemetry = registry
+	return p
 }
 
 // NewGitHubProvider 创建带超时的 GitHub Provider。token 支持逗号分隔的多值
@@ -97,6 +106,7 @@ func (p *GitHubProvider) handleRateLimited(token *tokenpool.TokenState, resp *ht
 		pauseUntil = time.Now().Add(60 * time.Second)
 	}
 	log.Printf("[github] rate limited (%d), disabling token until %s", resp.StatusCode, pauseUntil.Format(time.RFC3339))
+	p.telemetry.RateLimited()
 	p.pool.DisableUntil(token, pauseUntil, fmt.Sprintf("rate limited status %d", resp.StatusCode))
 }
 
@@ -114,6 +124,9 @@ func (p *GitHubProvider) Fetch(ctx context.Context, owner, repo string) (serving
 	if authErr != nil {
 		return serving.RepositoryMetadata{}, authErr
 	}
+	// 计数放在真正发请求之前：这里统计的是「对外产生了多少次 GitHub 调用」，
+	// 失败也要计，否则限流期间的调用量会被低估。
+	p.telemetry.MetadataRequested()
 	response, err := p.client.Do(request)
 	if err != nil {
 		return serving.RepositoryMetadata{}, err
@@ -197,6 +210,7 @@ func (p *GitHubProvider) StarHistory(ctx context.Context, owner, repo string, pa
 	if authErr != nil {
 		return model.GitHubStarHistoryWeekResponse{}, authErr
 	}
+	p.telemetry.HistoryRequested()
 	response, err := p.client.Do(request)
 	if err != nil {
 		return model.GitHubStarHistoryWeekResponse{}, err
@@ -238,6 +252,7 @@ func (p *GitHubProvider) fetchAvatarDataURI(ctx context.Context, rawURL string) 
 	}
 	request.Header.Set("Accept", "image/png,image/jpeg,image/webp,image/gif")
 	request.Header.Set("User-Agent", "starcat-history-api")
+	p.telemetry.AvatarRequested()
 	response, err := p.client.Do(request)
 	if err != nil {
 		return ""
