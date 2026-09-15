@@ -228,6 +228,15 @@ For example, the card below:
 
 The endpoint accepts only `theme=light|dark` and `locale=en|zh`, verifies that the repository is public, and returns a cacheable SVG without JavaScript, remote styles, or remote images. A repository must have at least two history points from the official endpoint before an image is available.
 
+A response carrying `X-Starcat-Cache: stale` is cached data served while GitHub was unavailable: the
+service keeps returning the last good curve (for up to an hour between retries, growing with each
+consecutive failure) instead of failing the image. Clients do not need to act on it, but it makes an
+upstream incident visible from a single `curl`.
+
+The very first request for a repository also has to download its whole weekly history from GitHub.
+When GitHub returns a `Link: rel="last"` header the service fetches the remaining pages with bounded
+concurrency, which brings a ~20-page repository from roughly 13 seconds down to about 5.
+
 The SVG advertises `Cache-Control: public, max-age=3600, s-maxage=86400, stale-while-revalidate=3600` with an `ETag`, so a rendered card can be up to an hour behind on a client and a day behind on a shared cache such as GitHub Camo. The star count on the card comes from cached repository metadata (24 hours by default), not from the curve itself, so it can lag the repository by up to that window. Pass `If-None-Match` to get a `304` when nothing changed.
 
 Use `&amp;` for query separators inside HTML attributes and plain `&` in shell commands. To download the SVG directly:

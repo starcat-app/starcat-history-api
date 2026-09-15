@@ -105,6 +105,8 @@ type HistoryHandler struct {
 	now                    func() time.Time
 	// telemetry 可为 nil；所有计数都走 nil-safe 方法，单测无需构造。
 	telemetry *telemetry.Registry
+	// backoff 记录每个仓库下一次允许回源的时间，避免故障期把重试变成放大器。
+	backoff *refreshBackoff
 }
 
 // NewHistoryHandler 创建查询 handler。
@@ -120,6 +122,7 @@ func NewHistoryHandler(store HistoryStore, metadata provider.MetadataProvider, m
 		officialMemoryCacheTTL: DefaultOfficialMemoryCacheTTL, maximumPoints: maximumPoints,
 		negativeCacheTTL: DefaultNegativeMetadataCacheTTL,
 		now:              time.Now, memory: cache.NewLRU(512), flights: &cache.Group{},
+		backoff: newRefreshBackoff(),
 	}
 	for _, option := range options {
 		if option != nil {

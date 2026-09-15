@@ -263,7 +263,54 @@ func (p *GitHubProvider) StarHistory(ctx context.Context, owner, repo string, pa
 	if err := json.NewDecoder(response.Body).Decode(&weeks); err != nil {
 		return model.GitHubStarHistoryWeekResponse{}, err
 	}
-	return model.GitHubStarHistoryWeekResponse{Weeks: weeks, ResponseETag: response.Header.Get("ETag")}, nil
+	return model.GitHubStarHistoryWeekResponse{
+		Weeks:        weeks,
+		ResponseETag: response.Header.Get("ETag"),
+		LastPage:     parseLastPage(response.Header.Get("Link")),
+	}, nil
+}
+
+// parseLastPage 从 Link 头里取出 rel="last" 的页码。
+//
+// GitHub 的 Link 形如:
+//
+//	<https://api.github.com/repositories/1/stargazers/history?page=2>; rel="next",
+//	<https://api.github.com/repositories/1/stargazers/history?page=23>; rel="last"
+//
+// 拿到总页数才有可能并行拉取：没有它就只能"逐页拉直到空页"，一个成熟仓库
+// （23 页）的冷启动要 13 秒。解析失败返回 0，调用方退化为顺序语义。
+func parseLastPage(header string) int {
+	for _, part := range strings.Split(header, ",") {
+		segments := strings.Split(part, ";")
+		if len(segments) < 2 {
+			continue
+		}
+		isLast := false
+		for _, segment := range segments[1:] {
+			if strings.Contains(segment, `rel="last"`) {
+				isLast = true
+				break
+			}
+		}
+		if !isLast {
+			continue
+		}
+		start := strings.Index(segments[0], "<")
+		end := strings.Index(segments[0], ">")
+		if start < 0 || end <= start {
+			continue
+		}
+		parsed, err := url.Parse(strings.TrimSpace(segments[0][start+1 : end]))
+		if err != nil {
+			continue
+		}
+		page, err := strconv.Atoi(parsed.Query().Get("page"))
+		if err != nil || page < 1 {
+			continue
+		}
+		return page
+	}
+	return 0
 }
 
 // fetchAvatarDataURI 将 GitHub owner avatar 内联到 SVG，保证 README 图片不依赖第二个远程资源。

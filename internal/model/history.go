@@ -25,6 +25,9 @@ type GitHubStarHistoryWeekResponse struct {
 	Weeks        []GitHubStarHistoryWeek
 	ResponseETag string
 	NotModified  bool
+	// LastPage 来自 Link 头 rel="last"；0 表示对端没有给出总页数。
+	// 有它才能把冷启动的逐页顺序拉取换成有界并行拉取。
+	LastPage int
 }
 
 // HistoryRange 是客户端支持的历史窗口。
