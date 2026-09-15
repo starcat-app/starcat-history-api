@@ -102,11 +102,14 @@ func Render(input RenderInput) ([]byte, error) {
 
 	labels := labelsFor(input.Locale)
 	palette := paletteFor(input.Theme)
+	// 日序号只算一次：它是"按日查询历史点"和绘制 x 坐标的共同输入，
+	// 逐点重算是渲染长历史时的主要成本。
+	days := pointDays(points)
 	plottingPoints := addingCreationBaseline(points, input.CreatedAt)
-	journey := buildJourney(points, input.CreatedAt, input.CurrentStars, input.CoverageStart)
+	journey := buildJourney(points, days, input.CreatedAt, input.CurrentStars, input.CoverageStart)
 	rendered := renderedPointsWithAnchors(plottingPoints, journey.chartEvents)
 	axis := newAxis(maximumCount(points))
-	metrics := buildMetrics(points, input.CreatedAt, input.CoverageStart, input.GeneratedAt)
+	metrics := buildMetrics(points, days, input.CreatedAt, input.CoverageStart, input.GeneratedAt)
 	fullName := strings.TrimSpace(input.FullName)
 	currentStars := compactNumber(input.CurrentStars)
 	updated := "—"
@@ -494,7 +497,7 @@ type historyMetrics struct {
 
 // buildMetrics 与 Starcat ReadmeStarHistoryMetrics 保持同一 90 天窗口和覆盖门禁。
 // 创建日补点不进入 points，因此不会把视觉基线误当成真实历史快照。
-func buildMetrics(points []model.HistoryPoint, createdAt, coverageStart, now time.Time) historyMetrics {
+func buildMetrics(points []model.HistoryPoint, days []int, createdAt, coverageStart, now time.Time) historyMetrics {
 	result := historyMetrics{}
 	if !createdAt.IsZero() && !now.IsZero() && !createdAt.After(now) {
 		days := calendarDays(createdAt, now)
@@ -511,7 +514,7 @@ func buildMetrics(points []model.HistoryPoint, createdAt, coverageStart, now tim
 	}
 	periodDays := calendarDays(start, latestDate)
 	result.periodDays = &periodDays
-	baseline := lastPointAtOrBefore(points, cutoff)
+	baseline := lastPointAtOrBefore(points, days, cutoff)
 	baselineCount := 0
 	if !recentCreation {
 		if baseline == nil {
@@ -561,7 +564,7 @@ type starJourney struct {
 	chartEvents  []journeyEvent
 }
 
-func buildJourney(points []model.HistoryPoint, createdAt time.Time, current int, coverageStart time.Time) starJourney {
+func buildJourney(points []model.HistoryPoint, days []int, createdAt time.Time, current int, coverageStart time.Time) starJourney {
 	latest := &points[len(points)-1]
 	latestDate := parseDate(latest.Date)
 	currentEvent := journeyEvent{kind: journeyCurrent, eventDate: latestDate, pointDate: latestDate, point: latest, priority: 1000}
@@ -595,7 +598,7 @@ func buildJourney(points []model.HistoryPoint, createdAt time.Time, current int,
 			}
 		}
 	}
-	if growth := growthEvent(points, current, coverageStart); growth != nil {
+	if growth := growthEvent(points, days, current, coverageStart); growth != nil {
 		events = append(events, *growth)
 	}
 	events = append(events, currentEvent)
@@ -649,7 +652,7 @@ func milestonePriority(threshold int) float64 {
 	return 58
 }
 
-func growthEvent(points []model.HistoryPoint, total int, coverageStart time.Time) *journeyEvent {
+func growthEvent(points []model.HistoryPoint, days []int, total int, coverageStart time.Time) *journeyEvent {
 	if len(points) < 2 {
 		return nil
 	}
@@ -665,25 +668,25 @@ func growthEvent(points []model.HistoryPoint, total int, coverageStart time.Time
 		if !coverageStart.IsZero() && parseDate(previous.Date).Before(coverageStart) {
 			continue
 		}
-		endDay := dayNumber(parseDate(point.Date))
+		endDay := days[index]
 		daily := point.Count - previous.Count
 		if daily >= dayMinimum && (bestDay == nil || daily > bestDay.growth) {
-			date := parseDate(point.Date)
+			date := dateFromDay(days[index])
 			candidate := journeyEvent{kind: journeyBestDay, eventDate: date, pointDate: date, point: &points[index], growth: daily, priority: 68}
 			bestDay = &candidate
 		}
-		baseline, ok := valueAtOrBefore(points, endDay-7)
+		baseline, ok := valueAtOrBefore(points, days, endDay-7)
 		if !ok {
 			continue
 		}
 		weekly := point.Count - baseline.Count
 		if weekly >= weekMinimum && (bestWeek == nil || weekly > bestWeek.growth) {
-			date := parseDate(point.Date)
+			date := dateFromDay(days[index])
 			candidate := journeyEvent{kind: journeyBestWeek, eventDate: date, pointDate: date, point: &points[index], growth: weekly, priority: 72}
 			bestWeek = &candidate
 		}
-		if earlier, ok := valueAtOrBefore(points, endDay-35); ok && weekly >= spikeMinimum && float64(weekly) >= float64(maxInt(0, baseline.Count-earlier.Count))/4*3 && (spike == nil || weekly > spike.growth) {
-			date := parseDate(point.Date)
+		if earlier, ok := valueAtOrBefore(points, days, endDay-35); ok && weekly >= spikeMinimum && float64(weekly) >= float64(maxInt(0, baseline.Count-earlier.Count))/4*3 && (spike == nil || weekly > spike.growth) {
+			date := dateFromDay(days[index])
 			candidate := journeyEvent{kind: journeySpike, eventDate: date, pointDate: date, point: &points[index], growth: weekly, priority: 100}
 			spike = &candidate
 		}
@@ -898,27 +901,79 @@ func preparePoints(points []model.HistoryPoint) ([]model.HistoryPoint, error) {
 	return result, nil
 }
 
+// parseDate 解析 "YYYY-MM-DD"（服务端唯一会生成的日期格式）。
+//
+// 不用 time.Parse：它每次都要走一遍格式扫描（实测解析一个日期约 0.6µs），而渲染
+// 长历史时这个函数会被调用几十万次（growthEvent 对每个点都要做两次"某天之前最近的
+// 点"查询），golang/go 这种 600+ 周的历史因此要 1 秒 CPU。手写拆分把单次成本降到
+// 几十纳秒，并保留 time.Parse 兜底以兼容非预期输入（例如测试夹具里的其它格式）。
 func parseDate(raw string) time.Time {
+	if len(raw) == 10 && raw[4] == '-' && raw[7] == '-' {
+		year, errYear := leadingDigits(raw[0:4])
+		month, errMonth := leadingDigits(raw[5:7])
+		day, errDay := leadingDigits(raw[8:10])
+		if errYear == nil && errMonth == nil && errDay == nil {
+			value := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+			// 必须回读校验：time.Date 会把 2026-02-30、2026-13-01 这类越界日期
+			// 规范化成另一天，而 time.Parse 会直接失败。上层靠"零值 = 非法日期"
+			// 拒绝脏数据，这里要保持同样的严格性。
+			if value.Year() == year && int(value.Month()) == month && value.Day() == day {
+				return value
+			}
+			return time.Time{}
+		}
+	}
 	value, _ := time.Parse("2006-01-02", raw)
 	return value
 }
 
-func lastPointAtOrBefore(points []model.HistoryPoint, target time.Time) *model.HistoryPoint {
-	for index := len(points) - 1; index >= 0; index-- {
-		if !parseDate(points[index].Date).After(target) {
-			return &points[index]
+// leadingDigits 解析定长的十进制片段；出现非数字即失败。
+func leadingDigits(raw string) (int, error) {
+	value := 0
+	for index := 0; index < len(raw); index++ {
+		character := raw[index]
+		if character < '0' || character > '9' {
+			return 0, fmt.Errorf("invalid date digit %q", character)
 		}
+		value = value*10 + int(character-'0')
 	}
-	return nil
+	return value, nil
 }
 
-func valueAtOrBefore(points []model.HistoryPoint, day int) (*model.HistoryPoint, bool) {
-	for index := len(points) - 1; index >= 0; index-- {
-		if dayNumber(parseDate(points[index].Date)) <= day {
-			return &points[index], true
-		}
+// pointDays 预计算每个点的日序号，供按日查询使用。
+//
+// points 在 preparePoints 之后按日期升序，因此可以配合二分查找把"某天之前最近的点"
+// 从 O(n) 降到 O(log n)：这个查询在 growthEvent 里是逐点调用的，累计起来是渲染长
+// 历史时最大的开销来源。
+func pointDays(points []model.HistoryPoint) []int {
+	days := make([]int, len(points))
+	for index, point := range points {
+		days[index] = dayNumber(parseDate(point.Date))
 	}
-	return nil, false
+	return days
+}
+
+// dateFromDay 是 dayNumber 的逆运算：把日序号还原为 UTC 零点。
+func dateFromDay(day int) time.Time { return time.Unix(int64(day)*86_400, 0).UTC() }
+
+func lastPointAtOrBefore(points []model.HistoryPoint, days []int, target time.Time) *model.HistoryPoint {
+	point, ok := valueAtOrBefore(points, days, dayNumber(target))
+	if !ok {
+		return nil
+	}
+	return point
+}
+
+// valueAtOrBefore 返回日序号 <= day 的最后一个点；points 与 days 必须等长且按日升序。
+func valueAtOrBefore(points []model.HistoryPoint, days []int, day int) (*model.HistoryPoint, bool) {
+	if len(points) != len(days) {
+		return nil, false
+	}
+	index := sort.SearchInts(days, day+1) - 1
+	if index < 0 || index >= len(points) {
+		return nil, false
+	}
+	return &points[index], true
 }
 
 func maximumCount(points []model.HistoryPoint) int {

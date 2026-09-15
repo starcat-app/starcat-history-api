@@ -127,7 +127,7 @@ func TestMetricsUseTheSameNinetyDayWindow(t *testing.T) {
 		{Date: "2026-03-31", Count: 200, Source: "gh_archive", Precision: "estimated"},
 	}
 	coverageStart := time.Date(2025, 12, 31, 0, 0, 0, 0, time.UTC)
-	metrics := buildMetrics(points, time.Time{}, coverageStart, time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC))
+	metrics := buildMetrics(points, pointDays(points), time.Time{}, coverageStart, time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC))
 	if metrics.growth == nil || *metrics.growth != 100 {
 		t.Fatalf("unexpected ninety-day growth: %#v", metrics.growth)
 	}
@@ -144,7 +144,7 @@ func TestMetricsUseZeroBaselineForRecentlyCreatedRepository(t *testing.T) {
 		{Date: "2026-03-05", Count: 10, Source: "gh_archive", Precision: "estimated"},
 		{Date: "2026-03-10", Count: 30, Source: "gh_archive", Precision: "estimated"},
 	}
-	metrics := buildMetrics(points, time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), time.Time{}, time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC))
+	metrics := buildMetrics(points, pointDays(points), time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), time.Time{}, time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC))
 	if metrics.growth == nil || *metrics.growth != 30 || metrics.growthRate != nil {
 		t.Fatalf("recent repository metrics must use zero baseline: %#v", metrics)
 	}
@@ -224,7 +224,7 @@ func TestBuildJourneyRecognizesOfficialHistorySource(t *testing.T) {
 		{Date: "2026-01-02", Count: 20, Source: "github_history", Precision: "reconstructed"},
 		{Date: "2026-01-03", Count: 100, Source: "github_history", Precision: "reconstructed"},
 	}
-	journey := buildJourney(points, time.Time{}, 100, time.Time{})
+	journey := buildJourney(points, pointDays(points), time.Time{}, 100, time.Time{})
 	foundFirstRecorded := false
 	for _, event := range journey.rankedEvents {
 		if event.kind == journeyFirstRecorded && event.point != nil && event.point.Count == 20 {
@@ -234,7 +234,7 @@ func TestBuildJourneyRecognizesOfficialHistorySource(t *testing.T) {
 	if !foundFirstRecorded {
 		t.Fatalf("official history data should produce a first-recorded event: %#v", journey.rankedEvents)
 	}
-	if growth := growthEvent(points, 100, time.Time{}); growth == nil || growth.kind != journeyBestDay {
+	if growth := growthEvent(points, pointDays(points), 100, time.Time{}); growth == nil || growth.kind != journeyBestDay {
 		t.Fatalf("official history data should participate in growth events: %#v", growth)
 	}
 }

@@ -7,3 +7,5 @@ builder/.venv/
 builder/.pytest_cache/
 builder/**/__pycache__/
 builder/*.egg-info/
+# go test -cpuprofile / -memprofile 会在包目录留下测试二进制
+*.test
