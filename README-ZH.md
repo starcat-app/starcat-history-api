@@ -131,6 +131,17 @@ make run
 官方 Star 历史的进程内缓存默认保留 30 分钟，可通过 `.env` 中的
 `OFFICIAL_MEMORY_CACHE_TTL_SECONDS` 调整；该配置只影响内存层，SQLite 官方历史缓存仍为 24 小时。
 
+另外三个开关决定"多久才允许回源一次 GitHub"：
+
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
+| `METADATA_TTL_SECONDS` | `86400` | 缓存的仓库元数据（星标、简介、主题）保持新鲜多久 |
+| `METADATA_NEGATIVE_CACHE_TTL_SECONDS` | `3600` | 不存在或非公开的仓库被记住"不可用"多久 |
+| `OFFICIAL_MEMORY_CACHE_TTL_SECONDS` | `1800` | 官方周数据在进程内的副本时长 |
+
+头像按 owner URL 只下载一次并复用 30 天，固定取 CDN 的小尺寸变体（`s=128`），上限 64KB。
+完整头像约 300KB、在部分网络环境要 9 秒以上（超过请求超时），因此永不请求。
+
 ```bash
 curl -fsS http://127.0.0.1:5014/healthz
 

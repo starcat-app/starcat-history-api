@@ -104,7 +104,7 @@ func TestMetadataCacheMissCountsAndStillFetches(t *testing.T) {
 	handler := NewHistoryHandler(store, metadataProvider, time.Hour, 400, WithTelemetry(registry))
 	handler.now = func() time.Time { return now }
 
-	if _, err := handler.resolvePublicMetadata(context.Background(), "owner", "repo"); err != nil {
+	if _, err := handler.resolveMetadataCached(context.Background(), 0, "owner", "repo"); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := registry.Snapshot()

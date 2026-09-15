@@ -48,7 +48,7 @@ func (h *HistoryHandler) HandleStarHistoryEmbed(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	metadata, err := h.resolvePublicMetadata(r.Context(), owner, repo)
+	metadata, err := h.resolveMetadataCached(r.Context(), 0, owner, repo)
 	if err != nil {
 		writeEmbedMetadataError(w, err)
 		return

@@ -46,6 +46,7 @@ type Options struct {
 	MetricsStoreFile       string
 	MetadataTTL            time.Duration
 	OfficialMemoryCacheTTL time.Duration
+	NegativeCacheTTL       time.Duration
 	MaximumPoints          int
 	MaxBundleBytes         int64
 	SnapshotRetention      int
@@ -83,6 +84,7 @@ func FromEnv() (*Service, error) {
 		MetricsStoreFile:       envOrDefault("METRICS_STORE_FILE", "./data/history-metrics.db"),
 		MetadataTTL:            kitenv.DurationSeconds("METADATA_TTL_SECONDS", 24*time.Hour),
 		OfficialMemoryCacheTTL: kitenv.DurationSeconds("OFFICIAL_MEMORY_CACHE_TTL_SECONDS", handler.DefaultOfficialMemoryCacheTTL),
+		NegativeCacheTTL:       kitenv.DurationSeconds("METADATA_NEGATIVE_CACHE_TTL_SECONDS", handler.DefaultNegativeMetadataCacheTTL),
 		MaximumPoints:          intEnv("MAXIMUM_HISTORY_POINTS", series.DefaultMaximumPoints),
 		MaxBundleBytes:         int64Env("MAX_BUNDLE_BYTES", defaultMaxBundleBytes),
 		SnapshotRetention:      intEnv("SNAPSHOT_RETENTION", defaultSnapshotRetention),
@@ -112,6 +114,9 @@ func New(opt Options) (*Service, error) {
 	if opt.OfficialMemoryCacheTTL <= 0 {
 		opt.OfficialMemoryCacheTTL = handler.DefaultOfficialMemoryCacheTTL
 	}
+	if opt.NegativeCacheTTL <= 0 {
+		opt.NegativeCacheTTL = handler.DefaultNegativeMetadataCacheTTL
+	}
 	if opt.MaximumPoints <= 0 {
 		opt.MaximumPoints = series.DefaultMaximumPoints
 	}
@@ -139,13 +144,17 @@ func New(opt Options) (*Service, error) {
 	// 进程内计数：kitmetrics 记录按路由的耗时/状态码，这里记录回源次数与缓存命中，
 	// 两者互补。用于压测取差值，也用于线上判断「慢」是缓存问题还是 GitHub 问题。
 	serviceTelemetry := telemetry.NewRegistry()
-	metadataProvider := provider.NewGitHubProvider(opt.GitHubEndpoint, opt.GitHubToken, nil).WithTelemetry(serviceTelemetry)
+	metadataProvider := provider.NewGitHubProvider(opt.GitHubEndpoint, opt.GitHubToken, nil).
+		WithTelemetry(serviceTelemetry).
+		// 头像按 URL 复用同一份 SQLite：它几乎不变，不该跟着元数据 TTL 每次重下。
+		WithAvatarCache(registry)
 	// 历史曲线与仓库 metadata 共用 GitHub client，但数据源明确切换到官方
 	// stargazers/history；旧 repo_history_series 仅继续服务 /events 调试接口。
 	historyHandler := handler.NewHistoryHandler(
 		registry, metadataProvider, opt.MetadataTTL, opt.MaximumPoints,
 		handler.WithStarHistoryProvider(metadataProvider),
 		handler.WithOfficialMemoryCacheTTL(opt.OfficialMemoryCacheTTL),
+		handler.WithNegativeCacheTTL(opt.NegativeCacheTTL),
 		handler.WithTelemetry(serviceTelemetry),
 	)
 	auth := middleware.NewBearerAuth(opt.APIKeys)

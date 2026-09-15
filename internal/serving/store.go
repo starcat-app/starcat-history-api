@@ -20,6 +20,15 @@ import (
 
 var ErrSeriesNotFound = errors.New("history series not found")
 
+const (
+	// avatarRetention 是头像行的物理保留期，比 handler 侧的 TTL 长得多：
+	// 过期只需要"不再当作命中"，不必立刻删除；留长一点让误判可回滚。
+	avatarRetention = 90 * 24 * time.Hour
+	// negativeMetadataRetention 限制负缓存表的增长上限。公开入口可以被任意
+	// owner/repo 刷，而 404 的仓库永远不会有正缓存来覆盖它。
+	negativeMetadataRetention = 7 * 24 * time.Hour
+)
+
 // RepositorySeries 是一条完整的仓库 WatchEvent 压缩序列。
 type RepositorySeries struct {
 	RepoID           int64
@@ -168,6 +177,19 @@ func (s *Store) initialize(ctx context.Context) error {
 			watermark TEXT NOT NULL,
 			checksum TEXT NOT NULL,
 			applied_at TEXT NOT NULL
+		)`,
+		// 头像与负缓存都是"命中就不必回源 GitHub"的旁路缓存。单独建表而不是塞进
+		// repository_metadata：头像要按 URL 复用（同一个 owner 的仓库共享一张图），
+		// 负缓存则连仓库身份都不需要（404 的仓库没有 repo_id）。
+		`CREATE TABLE IF NOT EXISTS repository_avatar (
+			url_key TEXT PRIMARY KEY,
+			data_uri TEXT NOT NULL,
+			fetched_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS repository_metadata_negative (
+			full_name TEXT PRIMARY KEY,
+			reason TEXT NOT NULL,
+			checked_at TEXT NOT NULL
 		)`,
 	}
 	for _, statement := range statements {
@@ -467,6 +489,97 @@ func (s *Store) SaveMetadata(ctx context.Context, value RepositoryMetadata) erro
 		}
 	}
 	return tx.Commit()
+}
+
+// Avatar 读取按归一化 URL 键控的头像 data URI。
+//
+// 返回 fetchedAt 而不在这里判 TTL：新鲜度口径（保留多久）属于调用方策略，
+// 存储层只负责"存了什么、什么时候存的"。
+func (s *Store) Avatar(ctx context.Context, urlKey string) (string, time.Time, bool, error) {
+	var dataURI, fetchedAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT data_uri, fetched_at FROM repository_avatar WHERE url_key = ?`,
+		normalizeCachePart(urlKey)).Scan(&dataURI, &fetchedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	fetched, err := time.Parse(time.RFC3339Nano, fetchedAt)
+	if err != nil {
+		// 时间戳损坏等同于缓存不可用：让调用方回源重新写一份，不要因为一行脏数据
+		// 让所有头像都退化成首字母占位。
+		return "", time.Time{}, false, nil
+	}
+	return dataURI, fetched, true, nil
+}
+
+// SaveAvatar 写入头像缓存，并顺带清理超过保留期的行。
+//
+// 清理放在写入路径而不是读路径：写入是低频事件（每个 URL 每 TTL 一次），
+// 而读路径在每个 SVG 请求上，不该承担删除成本。
+func (s *Store) SaveAvatar(ctx context.Context, urlKey, dataURI string, fetchedAt time.Time) error {
+	if strings.TrimSpace(urlKey) == "" || dataURI == "" {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO repository_avatar (url_key, data_uri, fetched_at) VALUES (?, ?, ?)
+		ON CONFLICT(url_key) DO UPDATE SET data_uri=excluded.data_uri, fetched_at=excluded.fetched_at`,
+		normalizeCachePart(urlKey), dataURI, fetchedAt.UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		return err
+	}
+	cutoff := fetchedAt.UTC().Add(-avatarRetention).Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM repository_avatar WHERE fetched_at < ?`, cutoff); err != nil {
+		return err
+	}
+	return nil
+}
+
+// NegativeMetadata 读取「该仓库不能对外提供历史」的负缓存条目。
+func (s *Store) NegativeMetadata(ctx context.Context, fullName string) (string, time.Time, bool, error) {
+	var reason, checkedAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT reason, checked_at FROM repository_metadata_negative WHERE full_name = ?`,
+		normalizeCachePart(fullName)).Scan(&reason, &checkedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	checked, err := time.Parse(time.RFC3339Nano, checkedAt)
+	if err != nil {
+		return "", time.Time{}, false, nil
+	}
+	return reason, checked, true, nil
+}
+
+// SaveNegativeMetadata 记录负缓存。reason 只用于排查（not_found / not_public）。
+func (s *Store) SaveNegativeMetadata(ctx context.Context, fullName, reason string, checkedAt time.Time) error {
+	if strings.TrimSpace(fullName) == "" {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO repository_metadata_negative (full_name, reason, checked_at) VALUES (?, ?, ?)
+		ON CONFLICT(full_name) DO UPDATE SET reason=excluded.reason, checked_at=excluded.checked_at`,
+		normalizeCachePart(fullName), reason, checkedAt.UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		return err
+	}
+	cutoff := checkedAt.UTC().Add(-negativeMetadataRetention).Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM repository_metadata_negative WHERE checked_at < ?`, cutoff); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ClearNegativeMetadata 在仓库被确认可取（公开且已有历史）后清掉负缓存，
+// 避免"曾经被判不可用"的仓库在 TTL 内继续被拒。
+func (s *Store) ClearNegativeMetadata(ctx context.Context, fullName string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM repository_metadata_negative WHERE full_name = ?`, normalizeCachePart(fullName))
+	return err
 }
 
 // Active 返回当前数据版本；空库返回零值而不是错误，便于健康检查启动。

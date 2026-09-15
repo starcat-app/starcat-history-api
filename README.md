@@ -130,6 +130,18 @@ The in-process cache for official Star history defaults to 30 minutes and can be
 `OFFICIAL_MEMORY_CACHE_TTL_SECONDS` in `.env`. This only changes the memory layer; the SQLite
 official-history cache remains valid for 24 hours.
 
+Three more knobs control how often the service is allowed to call GitHub:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `METADATA_TTL_SECONDS` | `86400` | How long a cached repository metadata row (stars, description, topics) stays fresh |
+| `METADATA_NEGATIVE_CACHE_TTL_SECONDS` | `3600` | How long a missing or non-public repository is remembered as unavailable |
+| `OFFICIAL_MEMORY_CACHE_TTL_SECONDS` | `1800` | In-process copy of the official weekly payload |
+
+Avatars are downloaded once per owner URL and reused for 30 days, always at the small CDN variant
+(`s=128`), capped at 64 KB. The full-size avatar is ~300 KB and takes ~9 s to download from some
+regions, which is more than the request timeout, so it is never requested.
+
 ```bash
 curl -fsS http://127.0.0.1:5014/healthz
 

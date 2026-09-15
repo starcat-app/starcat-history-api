@@ -26,7 +26,26 @@ var (
 	ErrRateLimited = errors.New("github rate limited")
 )
 
-const maximumAvatarBytes = 512 << 10
+const (
+	// maximumAvatarBytes 是内联进 SVG 的头像字节上限。卡片里头像只渲染到 ~96px，
+	// 64KB 足够高清；上限放宽到 512KB 时曾经产出一张 411KB 的 README 图片。
+	maximumAvatarBytes = 64 << 10
+	// avatarSizeParam 是 GitHub 头像 CDN 的尺寸参数。带上是 30KB，不带是 297KB。
+	avatarSizeParam = "128"
+	// avatarFetchTimeout 独立于客户端整体超时：头像只是装饰，不允许拖垮请求。
+	avatarFetchTimeout = 3 * time.Second
+	// avatarCacheTTL 头像几乎不变化，按 URL 缓存 30 天，避免跟着元数据 TTL 重复下载。
+	avatarCacheTTL = 30 * 24 * time.Hour
+)
+
+// AvatarCache 是按 URL 键控的头像持久缓存。
+//
+// 定义在 provider 侧而不是直接依赖 serving：provider 只要求"能读能写、带时间戳"，
+// 不关心底层是 SQLite 还是别的实现，单测可以塞内存实现。
+type AvatarCache interface {
+	Avatar(ctx context.Context, urlKey string) (dataURI string, fetchedAt time.Time, found bool, err error)
+	SaveAvatar(ctx context.Context, urlKey, dataURI string, fetchedAt time.Time) error
+}
 
 // MetadataProvider 隔离外部 GitHub API，便于 handler 单测和未来替换数据源。
 type MetadataProvider interface {
@@ -49,11 +68,19 @@ type GitHubProvider struct {
 	now    func() time.Time
 	// telemetry 可为 nil（测试与未装配埋点的调用方），所有计数都走 nil-safe 方法。
 	telemetry *telemetry.Registry
+	// avatarCache 可为 nil：未装配时退化为"每次都尝试下载"，不改变对外行为。
+	avatarCache AvatarCache
 }
 
 // WithTelemetry 注入计数指标；返回自身便于在装配处链式调用。
 func (p *GitHubProvider) WithTelemetry(registry *telemetry.Registry) *GitHubProvider {
 	p.telemetry = registry
+	return p
+}
+
+// WithAvatarCache 注入头像缓存，避免每次元数据刷新都重新下载头像。
+func (p *GitHubProvider) WithAvatarCache(cache AvatarCache) *GitHubProvider {
+	p.avatarCache = cache
 	return p
 }
 
@@ -240,13 +267,28 @@ func (p *GitHubProvider) StarHistory(ctx context.Context, owner, repo string, pa
 }
 
 // fetchAvatarDataURI 将 GitHub owner avatar 内联到 SVG，保证 README 图片不依赖第二个远程资源。
+//
 // 头像是可选装饰资源：请求失败、类型不受支持或超过上限时直接回退到首字母占位，不能阻断历史卡片。
+//
+// 三条硬约束（都是踩过的坑）：
+//   - 必须带尺寸参数：完整头像实测 297KB / 9.1s，而客户端整体超时只有 8s，等于每次
+//     元数据刷新都白等 8s 再丢弃；带 s=128 后是 30KB / 1.7s。卡片里头像只渲染到
+//     ~96px，原图大小纯属浪费。
+//   - 必须用自己的短超时：头像不能吃掉整个请求的超时预算。
+//   - 必须按 URL 缓存：头像几乎不变，没理由跟着元数据 TTL 每 24 小时重下一遍。
 func (p *GitHubProvider) fetchAvatarDataURI(ctx context.Context, rawURL string) string {
 	parsed, err := url.Parse(rawURL)
 	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Hostname(), "avatars.githubusercontent.com") {
 		return ""
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	key := avatarCacheKey(parsed)
+	if dataURI, ok := p.cachedAvatar(ctx, key); ok {
+		return dataURI
+	}
+
+	fetchCtx, cancel := context.WithTimeout(ctx, avatarFetchTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, key, nil)
 	if err != nil {
 		return ""
 	}
@@ -271,5 +313,41 @@ func (p *GitHubProvider) fetchAvatarDataURI(ctx context.Context, rawURL string) 
 	if err != nil || len(data) == 0 || len(data) > maximumAvatarBytes {
 		return ""
 	}
-	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)
+	dataURI := "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)
+	p.storeAvatar(ctx, key, dataURI)
+	return dataURI
+}
+
+// avatarCacheKey 在原始头像 URL 上补上尺寸参数，并以此作为缓存键。
+// 用归一化后的完整 URL 做键的好处：将来调整 avatarSizeParam 会自动换一份缓存，
+// 不会拿旧尺寸的图配新的渲染宽度。
+func avatarCacheKey(parsed *url.URL) string {
+	normalized := *parsed
+	query := normalized.Query()
+	query.Set("s", avatarSizeParam)
+	normalized.RawQuery = query.Encode()
+	return normalized.String()
+}
+
+// cachedAvatar 读头像缓存。缓存故障只降级为"没命中"，不能影响请求结果。
+func (p *GitHubProvider) cachedAvatar(ctx context.Context, key string) (string, bool) {
+	if p.avatarCache == nil {
+		return "", false
+	}
+	dataURI, fetchedAt, found, err := p.avatarCache.Avatar(ctx, key)
+	if err != nil || !found || dataURI == "" {
+		return "", false
+	}
+	if p.now().UTC().Sub(fetchedAt) >= avatarCacheTTL {
+		return "", false
+	}
+	return dataURI, true
+}
+
+func (p *GitHubProvider) storeAvatar(ctx context.Context, key, dataURI string) {
+	if p.avatarCache == nil || dataURI == "" {
+		return
+	}
+	// 写失败不影响本次响应：下次再取一次即可。
+	_ = p.avatarCache.SaveAvatar(ctx, key, dataURI, p.now().UTC())
 }
