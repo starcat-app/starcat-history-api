@@ -135,7 +135,7 @@ make run
 
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
-| `METADATA_TTL_SECONDS` | `86400` | 缓存的仓库元数据（星标、简介、主题）保持新鲜多久 |
+| `METADATA_TTL_SECONDS` | `21600` | 缓存的仓库元数据（星标、简介、主题）保持新鲜多久 |
 | `METADATA_NEGATIVE_CACHE_TTL_SECONDS` | `3600` | 不存在或非公开的仓库被记住"不可用"多久 |
 | `OFFICIAL_MEMORY_CACHE_TTL_SECONDS` | `1800` | 官方周数据在进程内的副本时长 |
 | `GITHUB_MAX_CONCURRENCY` | `8` | 全局出站 GitHub 并发上限；饱和时回退到缓存或 `stale` |

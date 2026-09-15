@@ -88,7 +88,7 @@ func FromEnv() (*Service, error) {
 		StoreFile:              envOrDefault("STORE_FILE", defaultStoreFile),
 		RegistryDir:            envOrDefault("REGISTRY_DIR", defaultRegistryDir),
 		MetricsStoreFile:       envOrDefault("METRICS_STORE_FILE", "./data/history-metrics.db"),
-		MetadataTTL:            kitenv.DurationSeconds("METADATA_TTL_SECONDS", 24*time.Hour),
+		MetadataTTL:            kitenv.DurationSeconds("METADATA_TTL_SECONDS", handler.DefaultMetadataTTL),
 		OfficialMemoryCacheTTL: kitenv.DurationSeconds("OFFICIAL_MEMORY_CACHE_TTL_SECONDS", handler.DefaultOfficialMemoryCacheTTL),
 		NegativeCacheTTL:       kitenv.DurationSeconds("METADATA_NEGATIVE_CACHE_TTL_SECONDS", handler.DefaultNegativeMetadataCacheTTL),
 		GitHubMaxConcurrency:   intEnv("GITHUB_MAX_CONCURRENCY", defaultGitHubMaxConcurrency),
@@ -116,7 +116,7 @@ func New(opt Options) (*Service, error) {
 		opt.MetricsStoreFile = ":memory:"
 	}
 	if opt.MetadataTTL <= 0 {
-		opt.MetadataTTL = 24 * time.Hour
+		opt.MetadataTTL = handler.DefaultMetadataTTL
 	}
 	if opt.OfficialMemoryCacheTTL <= 0 {
 		opt.OfficialMemoryCacheTTL = handler.DefaultOfficialMemoryCacheTTL

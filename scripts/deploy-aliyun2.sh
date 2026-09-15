@@ -119,7 +119,7 @@ API_KEYS=$api_key
 STORE_FILE=$remote_dir/data/history.sqlite
 REGISTRY_DIR=$remote_dir/data/history-registry
 METRICS_STORE_FILE=$remote_dir/data/history-metrics.db
-METADATA_TTL_SECONDS=86400
+METADATA_TTL_SECONDS=21600
 OFFICIAL_MEMORY_CACHE_TTL_SECONDS=1800
 MAXIMUM_HISTORY_POINTS=400
 # 支持 GITHUB_TOKENS（逗号分隔多 token 轮询）或 GITHUB_TOKEN（单值）。

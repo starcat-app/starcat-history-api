@@ -134,7 +134,7 @@ Three more knobs control how often the service is allowed to call GitHub:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `METADATA_TTL_SECONDS` | `86400` | How long a cached repository metadata row (stars, description, topics) stays fresh |
+| `METADATA_TTL_SECONDS` | `21600` | How long a cached repository metadata row (stars, description, topics) stays fresh |
 | `METADATA_NEGATIVE_CACHE_TTL_SECONDS` | `3600` | How long a missing or non-public repository is remembered as unavailable |
 | `OFFICIAL_MEMORY_CACHE_TTL_SECONDS` | `1800` | In-process copy of the official weekly payload |
 | `GITHUB_MAX_CONCURRENCY` | `8` | Global cap on in-flight GitHub requests; saturated callers fall back to cache or `stale` |

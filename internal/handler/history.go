@@ -43,6 +43,14 @@ type GitHubHistoryCacheStore interface {
 	TouchGitHubStarHistoryCache(context.Context, string, string, time.Time) error
 }
 
+// DefaultMetadataTTL 是公开仓库元数据（星标数、简介、主题）的默认新鲜期。
+//
+// 取 6 小时而不是 24 小时：README 卡片上最显眼的就是星标总数，而元数据回源的
+// 成本是 1 次 REST + 1 张已经按 URL 缓存 30 天的头像，降 TTL 换来的是"星标数
+// 半天内必然跟上"。按每个被嵌入的仓库每天 4 次估算，量级对配额仍然微不足道
+// （5 个 token × 5000 次/小时）。
+const DefaultMetadataTTL = 6 * time.Hour
+
 // DefaultNegativeMetadataCacheTTL 是「不可用仓库」的默认负缓存时长。
 //
 // 取 1 小时是两组需求的交点：一方面公开入口会被任意 owner/repo 扫，没有负缓存就是
@@ -112,7 +120,7 @@ type HistoryHandler struct {
 // NewHistoryHandler 创建查询 handler。
 func NewHistoryHandler(store HistoryStore, metadata provider.MetadataProvider, metadataTTL time.Duration, maximumPoints int, options ...HistoryHandlerOption) *HistoryHandler {
 	if metadataTTL <= 0 {
-		metadataTTL = 24 * time.Hour
+		metadataTTL = DefaultMetadataTTL
 	}
 	if maximumPoints <= 0 {
 		maximumPoints = series.DefaultMaximumPoints
