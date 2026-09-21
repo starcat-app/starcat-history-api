@@ -27,6 +27,7 @@ NGINX_CONF_LOCAL="$REPO_ROOT/scripts/history.starcat.ink.conf"
 NGINX_CONF_REMOTE="/etc/nginx/conf.d/history.starcat.ink.conf"
 LISTEN_PORT="5014"
 DEPLOY_SSH_KEY="${DEPLOY_SSH_KEY:-}"
+VERSION="${VERSION:-0.0.0-dev}"
 
 SSH_CMD=(ssh)
 RSYNC_SSH="ssh"
@@ -41,6 +42,7 @@ echo "本地仓库:  $REPO_ROOT"
 echo "远程服务器: $REMOTE_HOST"
 echo "远程目录:  $REMOTE_DIR"
 echo "公开入口:  https://history.starcat.ink"
+echo "服务版本:  $VERSION"
 echo "================================"
 
 if [[ "$(uname -s)" != "Darwin" ]] && ! command -v go >/dev/null 2>&1; then
@@ -57,7 +59,8 @@ mkdir -p "$REPO_ROOT/bin"
 (
     cd "$REPO_ROOT"
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-        go build -trimpath -ldflags "-s -w" \
+        go build -trimpath \
+        -ldflags "-s -w -X github.com/starcat-app/starcat-history-api/internal/version.Version=$VERSION" \
         -o bin/starcat-history-api-linux-amd64 ./cmd/server
 )
 ls -lh "$REPO_ROOT/bin/starcat-history-api-linux-amd64"

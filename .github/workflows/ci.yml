@@ -51,6 +51,15 @@ jobs:
       - name: Run tests
         run: go test -v -race -coverprofile=coverage.out ./...
 
+      # 发布版本由聚合镜像或部署脚本通过 linker 注入；单测锁住 Version 必须是可写变量。
+      - name: Verify release version injection
+        env:
+          STARCAT_HISTORY_EXPECTED_VERSION: 9.9.9-test
+        run: >-
+          go test -run '^TestVersionMatchesExpectedBuildValue$'
+          -ldflags='-X github.com/starcat-app/starcat-history-api/internal/version.Version=9.9.9-test'
+          ./internal/version
+
       - name: Build
         run: go build -v -o starcat-history-api ./cmd/server/
 

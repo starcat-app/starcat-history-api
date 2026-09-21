@@ -1,5 +1,8 @@
 .PHONY: test test-go test-builder build run install-local-snapshot
 
+VERSION ?= 0.0.0-dev
+VERSION_SYMBOL := github.com/starcat-app/starcat-history-api/internal/version.Version
+
 test: test-go test-builder
 
 test-go:
@@ -11,7 +14,7 @@ test-builder:
 
 build:
 	mkdir -p bin
-	go build -o bin/starcat-history-api ./cmd/server
+	go build -ldflags "-X $(VERSION_SYMBOL)=$(VERSION)" -o bin/starcat-history-api ./cmd/server
 
 run:
 	go run ./cmd/server
