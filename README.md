@@ -130,6 +130,19 @@ The in-process cache for official Star history defaults to 30 minutes and can be
 `OFFICIAL_MEMORY_CACHE_TTL_SECONDS` in `.env`. This only changes the memory layer; the SQLite
 official-history cache remains valid for 24 hours.
 
+Three more knobs control how often the service is allowed to call GitHub:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `METADATA_TTL_SECONDS` | `21600` | How long a cached repository metadata row (stars, description, topics) stays fresh |
+| `METADATA_NEGATIVE_CACHE_TTL_SECONDS` | `3600` | How long a missing or non-public repository is remembered as unavailable |
+| `OFFICIAL_MEMORY_CACHE_TTL_SECONDS` | `1800` | In-process copy of the official weekly payload |
+| `GITHUB_MAX_CONCURRENCY` | `8` | Global cap on in-flight GitHub requests; saturated callers fall back to cache or `stale` |
+
+Avatars are downloaded once per owner URL and reused for 30 days, always at the small CDN variant
+(`s=128`), capped at 64 KB. The full-size avatar is ~300 KB and takes ~9 s to download from some
+regions, which is more than the request timeout, so it is never requested.
+
 ```bash
 curl -fsS http://127.0.0.1:5014/healthz
 
@@ -139,6 +152,16 @@ curl -fsS \
 ```
 
 Do not commit `.env`, API keys, GitHub tokens, or generated SQLite databases.
+
+Measure the running instance (latency percentiles plus GitHub-call deltas). Pass the server's
+`API_KEYS` value so the script can read `/internal/metrics/service`:
+
+```bash
+scripts/bench-history-api.sh --base http://127.0.0.1:5014 --key "$API_KEY" --cold some-org/some-repo
+```
+
+The `--cold` scenario points at a repository that is not cached yet: it verifies that concurrent
+cold requests collapse into a single GitHub call instead of one call per request.
 
 ## API
 
@@ -150,6 +173,8 @@ Do not commit `.env`, API keys, GitHub tokens, or generated SQLite databases.
 | `GET` | `/api/v1/repos/{owner}/{repo}/star-history` | None | Calibrated public-repository curve |
 | `GET` | `/internal/stats` | `API_KEYS` | Serving scale and cache statistics |
 | `GET` | `/internal/metrics/*` | `API_KEYS` | Aggregated service metrics |
+| `GET` | `/internal/metrics/service` | `API_KEYS` | In-process counters: GitHub calls, cache hits, stale serves |
+| `POST` | `/internal/metrics/service/reset` | `API_KEYS` | Zero those counters (used by the bench script) |
 
 Query the calibrated curve:
 
@@ -203,6 +228,17 @@ For example, the card below:
 </a>
 
 The endpoint accepts only `theme=light|dark` and `locale=en|zh`, verifies that the repository is public, and returns a cacheable SVG without JavaScript, remote styles, or remote images. A repository must have at least two history points from the official endpoint before an image is available.
+
+A response carrying `X-Starcat-Cache: stale` is cached data served while GitHub was unavailable: the
+service keeps returning the last good curve (for up to an hour between retries, growing with each
+consecutive failure) instead of failing the image. Clients do not need to act on it, but it makes an
+upstream incident visible from a single `curl`.
+
+The very first request for a repository also has to download its whole weekly history from GitHub.
+When GitHub returns a `Link: rel="last"` header the service fetches the remaining pages with bounded
+concurrency, which brings a ~20-page repository from roughly 13 seconds down to about 5.
+
+The SVG advertises `Cache-Control: public, max-age=3600, s-maxage=86400, stale-while-revalidate=3600` with an `ETag`, so a rendered card can be up to an hour behind on a client and a day behind on a shared cache such as GitHub Camo. The star count on the card comes from cached repository metadata (24 hours by default), not from the curve itself, so it can lag the repository by up to that window. Pass `If-None-Match` to get a `304` when nothing changed.
 
 Use `&amp;` for query separators inside HTML attributes and plain `&` in shell commands. To download the SVG directly:
 

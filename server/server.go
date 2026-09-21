@@ -20,13 +20,19 @@ import (
 	"github.com/starcat-app/starcat-history-api/internal/provider"
 	"github.com/starcat-app/starcat-history-api/internal/series"
 	"github.com/starcat-app/starcat-history-api/internal/serving"
+	"github.com/starcat-app/starcat-history-api/internal/telemetry"
 	"github.com/starcat-app/starcat-history-api/internal/version"
 )
 
 const (
-	defaultPort        = "5014"
-	defaultRegistryDir = "./data/history-registry"
-	defaultStoreFile   = "./data/history.sqlite"
+	defaultPort = "5014"
+	// defaultGitHubMaxConcurrency 是全局出站闸门的默认并发上限。
+	// 8 的取舍：并发冷启动（多个仓库的 README 同时首次被访问）时，单仓库分页会占 4 个
+	// 槽位，8 允许两三个仓库同时推进；再高就容易踩 GitHub 的二级限流，反而让整池 token
+	// 被禁几分钟。饱和时请求排队，超时后回退到缓存或 stale 数据。
+	defaultGitHubMaxConcurrency = 8
+	defaultRegistryDir          = "./data/history-registry"
+	defaultStoreFile            = "./data/history.sqlite"
 	// 全量 4000 万级仓库快照可能超过 2 GiB，默认上限保留到 16 GiB；
 	// 实际 Fly 卷容量与上传窗口仍由运维侧单独控制。
 	defaultMaxBundleBytes    = int64(16 << 30)
@@ -45,6 +51,8 @@ type Options struct {
 	MetricsStoreFile       string
 	MetadataTTL            time.Duration
 	OfficialMemoryCacheTTL time.Duration
+	NegativeCacheTTL       time.Duration
+	GitHubMaxConcurrency   int
 	MaximumPoints          int
 	MaxBundleBytes         int64
 	SnapshotRetention      int
@@ -80,8 +88,10 @@ func FromEnv() (*Service, error) {
 		StoreFile:              envOrDefault("STORE_FILE", defaultStoreFile),
 		RegistryDir:            envOrDefault("REGISTRY_DIR", defaultRegistryDir),
 		MetricsStoreFile:       envOrDefault("METRICS_STORE_FILE", "./data/history-metrics.db"),
-		MetadataTTL:            kitenv.DurationSeconds("METADATA_TTL_SECONDS", 24*time.Hour),
+		MetadataTTL:            kitenv.DurationSeconds("METADATA_TTL_SECONDS", handler.DefaultMetadataTTL),
 		OfficialMemoryCacheTTL: kitenv.DurationSeconds("OFFICIAL_MEMORY_CACHE_TTL_SECONDS", handler.DefaultOfficialMemoryCacheTTL),
+		NegativeCacheTTL:       kitenv.DurationSeconds("METADATA_NEGATIVE_CACHE_TTL_SECONDS", handler.DefaultNegativeMetadataCacheTTL),
+		GitHubMaxConcurrency:   intEnv("GITHUB_MAX_CONCURRENCY", defaultGitHubMaxConcurrency),
 		MaximumPoints:          intEnv("MAXIMUM_HISTORY_POINTS", series.DefaultMaximumPoints),
 		MaxBundleBytes:         int64Env("MAX_BUNDLE_BYTES", defaultMaxBundleBytes),
 		SnapshotRetention:      intEnv("SNAPSHOT_RETENTION", defaultSnapshotRetention),
@@ -106,10 +116,13 @@ func New(opt Options) (*Service, error) {
 		opt.MetricsStoreFile = ":memory:"
 	}
 	if opt.MetadataTTL <= 0 {
-		opt.MetadataTTL = 24 * time.Hour
+		opt.MetadataTTL = handler.DefaultMetadataTTL
 	}
 	if opt.OfficialMemoryCacheTTL <= 0 {
 		opt.OfficialMemoryCacheTTL = handler.DefaultOfficialMemoryCacheTTL
+	}
+	if opt.NegativeCacheTTL <= 0 {
+		opt.NegativeCacheTTL = handler.DefaultNegativeMetadataCacheTTL
 	}
 	if opt.MaximumPoints <= 0 {
 		opt.MaximumPoints = series.DefaultMaximumPoints
@@ -135,13 +148,23 @@ func New(opt Options) (*Service, error) {
 		registry.Close()
 		return nil, fmt.Errorf("initialize metrics collector: %w", err)
 	}
-	metadataProvider := provider.NewGitHubProvider(opt.GitHubEndpoint, opt.GitHubToken, nil)
+	// 进程内计数：kitmetrics 记录按路由的耗时/状态码，这里记录回源次数与缓存命中，
+	// 两者互补。用于压测取差值，也用于线上判断「慢」是缓存问题还是 GitHub 问题。
+	serviceTelemetry := telemetry.NewRegistry()
+	metadataProvider := provider.NewGitHubProvider(opt.GitHubEndpoint, opt.GitHubToken, nil).
+		WithTelemetry(serviceTelemetry).
+		// 头像按 URL 复用同一份 SQLite：它几乎不变，不该跟着元数据 TTL 每次重下。
+		WithAvatarCache(registry).
+		// 所有出站 GitHub 调用（metadata / 分页 / 头像）共用一道全局闸门。
+		WithConcurrencyLimit(opt.GitHubMaxConcurrency)
 	// 历史曲线与仓库 metadata 共用 GitHub client，但数据源明确切换到官方
 	// stargazers/history；旧 repo_history_series 仅继续服务 /events 调试接口。
 	historyHandler := handler.NewHistoryHandler(
 		registry, metadataProvider, opt.MetadataTTL, opt.MaximumPoints,
 		handler.WithStarHistoryProvider(metadataProvider),
 		handler.WithOfficialMemoryCacheTTL(opt.OfficialMemoryCacheTTL),
+		handler.WithNegativeCacheTTL(opt.NegativeCacheTTL),
+		handler.WithTelemetry(serviceTelemetry),
 	)
 	auth := middleware.NewBearerAuth(opt.APIKeys)
 	metricsHandler := kitmetrics.NewHandler(Name(), metrics.Store())
@@ -161,6 +184,9 @@ func New(opt Options) (*Service, error) {
 	mux.Handle("GET /internal/metrics/timeseries", auth.Wrap(http.HandlerFunc(metricsHandler.HandleTimeseries)))
 	mux.Handle("GET /internal/metrics/routes", auth.Wrap(http.HandlerFunc(metricsHandler.HandleRoutes)))
 	mux.Handle("GET /internal/metrics/status-codes", auth.Wrap(http.HandlerFunc(metricsHandler.HandleStatusCodes)))
+	// 进程内计数：GET 读快照，POST 归零（压测取单场景差值用，因此不能用 GET 清零）。
+	mux.Handle("GET /internal/metrics/service", auth.Wrap(handler.HandleServiceMetrics(serviceTelemetry)))
+	mux.Handle("POST /internal/metrics/service/reset", auth.Wrap(handler.HandleServiceMetricsReset(serviceTelemetry)))
 	if len(opt.PublishKeys) > 0 {
 		publishAuth := middleware.NewBearerAuth(opt.PublishKeys)
 		publishHandler := handler.NewPublishHandler(registry, opt.MaxBundleBytes)
@@ -175,6 +201,7 @@ func New(opt Options) (*Service, error) {
 		log.Printf("  GET /api/v1/repos/{owner}/{repo}/star-history")
 		log.Printf("  GET /api/v1/repos/{owner}/{repo}/star-history/events")
 		log.Printf("  GET /internal/stats")
+		log.Printf("  GET /internal/metrics/service")
 		if len(opt.PublishKeys) > 0 {
 			log.Printf("  POST /internal/v1/history-snapshots/{model_version}")
 			log.Printf("  POST /internal/v1/history-deltas/{delta_id}")

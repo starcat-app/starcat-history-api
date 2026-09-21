@@ -231,6 +231,39 @@ func (r *Registry) TouchGitHubStarHistoryCache(ctx context.Context, owner, repo 
 	return r.store.TouchGitHubStarHistoryCache(ctx, owner, repo, fetchedAt)
 }
 
+// 负缓存与头像缓存都挂在当前 active store 上：它们都是可重建的旁路缓存，
+// 跟着数据目录一起切换，不需要跨 store 聚合。
+func (r *Registry) NegativeMetadata(ctx context.Context, fullName string) (string, time.Time, bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.store.NegativeMetadata(ctx, fullName)
+}
+
+func (r *Registry) SaveNegativeMetadata(ctx context.Context, fullName, reason string, checkedAt time.Time) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.store.SaveNegativeMetadata(ctx, fullName, reason, checkedAt)
+}
+
+func (r *Registry) ClearNegativeMetadata(ctx context.Context, fullName string) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.store.ClearNegativeMetadata(ctx, fullName)
+}
+
+// Avatar 代理头像缓存读写，供 provider 复用同一份 SQLite。
+func (r *Registry) Avatar(ctx context.Context, urlKey string) (string, time.Time, bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.store.Avatar(ctx, urlKey)
+}
+
+func (r *Registry) SaveAvatar(ctx context.Context, urlKey, dataURI string, fetchedAt time.Time) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.store.SaveAvatar(ctx, urlKey, dataURI, fetchedAt)
+}
+
 func (r *Registry) Active(ctx context.Context) (ActiveState, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

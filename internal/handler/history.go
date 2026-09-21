@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	"github.com/starcat-app/starcat-history-api/internal/provider"
 	"github.com/starcat-app/starcat-history-api/internal/series"
 	"github.com/starcat-app/starcat-history-api/internal/serving"
+	"github.com/starcat-app/starcat-history-api/internal/telemetry"
 )
 
 var repositoryPathPart = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
@@ -27,6 +29,9 @@ type HistoryStore interface {
 	Metadata(context.Context, int64) (serving.RepositoryMetadata, bool, error)
 	MetadataByFullName(context.Context, string) (serving.RepositoryMetadata, bool, error)
 	SaveMetadata(context.Context, serving.RepositoryMetadata) error
+	NegativeMetadata(context.Context, string) (string, time.Time, bool, error)
+	SaveNegativeMetadata(context.Context, string, string, time.Time) error
+	ClearNegativeMetadata(context.Context, string) error
 	Active(context.Context) (serving.ActiveState, error)
 }
 
@@ -37,6 +42,27 @@ type GitHubHistoryCacheStore interface {
 	SaveGitHubStarHistoryCache(context.Context, string, string, model.GitHubStarHistoryCache) error
 	TouchGitHubStarHistoryCache(context.Context, string, string, time.Time) error
 }
+
+// DefaultMetadataTTL 是公开仓库元数据（星标数、简介、主题）的默认新鲜期。
+//
+// 取 6 小时而不是 24 小时：README 卡片上最显眼的就是星标总数，而元数据回源的
+// 成本是 1 次 REST + 1 张已经按 URL 缓存 30 天的头像，降 TTL 换来的是"星标数
+// 半天内必然跟上"。按每个被嵌入的仓库每天 4 次估算，量级对配额仍然微不足道
+// （5 个 token × 5000 次/小时）。
+const DefaultMetadataTTL = 6 * time.Hour
+
+// DefaultNegativeMetadataCacheTTL 是「不可用仓库」的默认负缓存时长。
+//
+// 取 1 小时是两组需求的交点：一方面公开入口会被任意 owner/repo 扫，没有负缓存就是
+// 每次一次 GitHub 调用；另一方面仓库从私有转公开、或误删后重建，最多只应等这么久
+// 就能重新被收录。
+const DefaultNegativeMetadataCacheTTL = time.Hour
+
+// 负缓存原因，仅用于排查（存进 repository_metadata_negative.reason）。
+const (
+	metadataNegativeNotFound  = "not_found"
+	metadataNegativeNotPublic = "not_public"
+)
 
 // HistoryHandlerOption 配置官方历史数据源。
 type HistoryHandlerOption func(*HistoryHandler)
@@ -56,6 +82,21 @@ func WithOfficialMemoryCacheTTL(value time.Duration) HistoryHandlerOption {
 	}
 }
 
+// WithTelemetry 注入进程内计数指标，用于观测缓存命中与回源次数。
+func WithTelemetry(registry *telemetry.Registry) HistoryHandlerOption {
+	return func(h *HistoryHandler) { h.telemetry = registry }
+}
+
+// WithNegativeCacheTTL 设置「不可用仓库」（404 / 非公开）的负缓存时长。
+// 小于等于 0 的值会被忽略：关掉负缓存等于把公开入口直接暴露给任意 owner/repo 刷量。
+func WithNegativeCacheTTL(value time.Duration) HistoryHandlerOption {
+	return func(h *HistoryHandler) {
+		if value > 0 {
+			h.negativeCacheTTL = value
+		}
+	}
+}
+
 // HistoryHandler 生成客户端兼容响应；生产配置优先使用 GitHub 官方周历史，
 // 旧压缩序列只保留给 /events 原始事件接口和未装配官方 provider 的兼容测试。
 type HistoryHandler struct {
@@ -67,14 +108,19 @@ type HistoryHandler struct {
 	flights                *cache.Group
 	metadataTTL            time.Duration
 	officialMemoryCacheTTL time.Duration
+	negativeCacheTTL       time.Duration
 	maximumPoints          int
 	now                    func() time.Time
+	// telemetry 可为 nil；所有计数都走 nil-safe 方法，单测无需构造。
+	telemetry *telemetry.Registry
+	// backoff 记录每个仓库下一次允许回源的时间，避免故障期把重试变成放大器。
+	backoff *refreshBackoff
 }
 
 // NewHistoryHandler 创建查询 handler。
 func NewHistoryHandler(store HistoryStore, metadata provider.MetadataProvider, metadataTTL time.Duration, maximumPoints int, options ...HistoryHandlerOption) *HistoryHandler {
 	if metadataTTL <= 0 {
-		metadataTTL = 24 * time.Hour
+		metadataTTL = DefaultMetadataTTL
 	}
 	if maximumPoints <= 0 {
 		maximumPoints = series.DefaultMaximumPoints
@@ -82,7 +128,9 @@ func NewHistoryHandler(store HistoryStore, metadata provider.MetadataProvider, m
 	handler := &HistoryHandler{
 		store: store, metadata: metadata, metadataTTL: metadataTTL,
 		officialMemoryCacheTTL: DefaultOfficialMemoryCacheTTL, maximumPoints: maximumPoints,
-		now: time.Now, memory: cache.NewLRU(512), flights: &cache.Group{},
+		negativeCacheTTL: DefaultNegativeMetadataCacheTTL,
+		now:              time.Now, memory: cache.NewLRU(512), flights: &cache.Group{},
+		backoff: newRefreshBackoff(),
 	}
 	for _, option := range options {
 		if option != nil {
@@ -160,7 +208,7 @@ func (h *HistoryHandler) HandleStarHistory(w http.ResponseWriter, r *http.Reques
 	etag := historyETag(repoID, historyRange, currentStars, storedSeries.SeriesChecksum, active)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "private, max-age=3600")
-	if r.Header.Get("If-None-Match") == etag {
+	if ifNoneMatch(r.Header.Get("If-None-Match"), etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -215,7 +263,7 @@ func (h *HistoryHandler) HandleStarHistoryEvents(w http.ResponseWriter, r *http.
 	etag := eventsETag(repoID, storedSeries.SeriesChecksum, active)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "private, max-age=3600")
-	if r.Header.Get("If-None-Match") == etag {
+	if ifNoneMatch(r.Header.Get("If-None-Match"), etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -284,12 +332,12 @@ func (h *HistoryHandler) loadDecodedSeries(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *HistoryHandler) requirePublicMetadata(w http.ResponseWriter, r *http.Request, repoID int64, owner, repo string) (serving.RepositoryMetadata, bool) {
-	metadata, err := h.resolveMetadata(r.Context(), repoID, owner, repo)
+	metadata, err := h.resolveMetadataCached(r.Context(), repoID, owner, repo)
 	if errors.Is(err, provider.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "REPOSITORY_NOT_FOUND", "Repository was not found.", nil)
 		return serving.RepositoryMetadata{}, false
 	}
-	if errors.Is(err, provider.ErrRateLimited) {
+	if isUpstreamBusy(err) {
 		w.Header().Set("Retry-After", "60")
 		writeError(w, http.StatusTooManyRequests, "GITHUB_RATE_LIMITED", "GitHub metadata is temporarily unavailable.", nil)
 		return serving.RepositoryMetadata{}, false
@@ -318,13 +366,63 @@ func (h *HistoryHandler) requireActive(w http.ResponseWriter, r *http.Request) (
 	return active, true
 }
 
-func (h *HistoryHandler) resolveMetadata(ctx context.Context, repoID int64, owner, repo string) (serving.RepositoryMetadata, error) {
-	cached, found, err := h.store.Metadata(ctx, repoID)
+// lookupMetadataCache 先按 repo_id、再按 full name 查公开元数据缓存。
+//
+// 为什么必须回退 full name：曲线接口的 repo_id 是可选 query，第三方不传时 repoID 为 0，
+// 而缓存行里的 repo_id 永远是真实 GitHub ID（>0），`WHERE repo_id = 0` 永不命中 ——
+// 缓存写进去了却永远读不到，于是每个请求都回源 GitHub（线上实测 8.5s/次）。
+func (h *HistoryHandler) lookupMetadataCache(ctx context.Context, repoID int64, owner, repo string) (serving.RepositoryMetadata, bool, error) {
+	if repoID > 0 {
+		value, found, err := h.store.Metadata(ctx, repoID)
+		if err != nil {
+			return serving.RepositoryMetadata{}, false, err
+		}
+		if found {
+			return value, true, nil
+		}
+	}
+	value, found, err := h.store.MetadataByFullName(ctx, owner+"/"+repo)
+	if err != nil {
+		return serving.RepositoryMetadata{}, false, err
+	}
+	if !found {
+		return serving.RepositoryMetadata{}, false, nil
+	}
+	// 调用方指名了 repo_id 时，按名字命中的行必须与之一致；不一致宁可当未命中，
+	// 交给下面的回源重新确认（仓库改名/转移后 full name 可能指向另一条记录）。
+	if repoID > 0 && value.RepoID != repoID {
+		return serving.RepositoryMetadata{}, false, nil
+	}
+	return value, true, nil
+}
+
+// resolveMetadataCached 解析仓库元数据，两条查询路径共用：
+// 内存/持久缓存 → 负缓存 → singleflight 回源。
+//
+// 关于 Public 门禁：README 图片请求不可能携带 API key，所以这里既是缓存入口也是
+// 唯一的可见性校验点。"不可用"（404 或非公开）会被写进负缓存，避免公开入口被
+// 反复抓取不存在的仓库时无上限消耗 GitHub 额度。
+func (h *HistoryHandler) resolveMetadataCached(ctx context.Context, repoID int64, owner, repo string) (serving.RepositoryMetadata, error) {
+	fullName := owner + "/" + repo
+	cached, found, err := h.lookupMetadataCache(ctx, repoID, owner, repo)
 	if err != nil {
 		return serving.RepositoryMetadata{}, err
 	}
-	if found && h.now().UTC().Sub(cached.CheckedAt) < h.metadataTTL {
+	now := h.now().UTC()
+	if found && now.Sub(cached.CheckedAt) < h.metadataTTL {
+		h.telemetry.MetadataCacheHit()
 		return cached, nil
+	}
+	if reason, checkedAt, ok := h.negativeMetadata(ctx, fullName); ok && now.Sub(checkedAt) < h.negativeCacheTTL {
+		h.telemetry.MetadataNegativeHit()
+		if reason == metadataNegativeNotFound {
+			return serving.RepositoryMetadata{}, provider.ErrNotFound
+		}
+		// 只知道"不能对外提供"，不知道它的 repo_id；调用方指名了就把那个 id 带回去，
+		// 让两条路径各自走到既有的「非公开」分支（SVG 404 / 曲线 422）。
+		return serving.RepositoryMetadata{
+			RepoID: repoID, FullName: fullName, Visibility: "private", CheckedAt: checkedAt,
+		}, nil
 	}
 	if h.metadata == nil {
 		if found {
@@ -332,8 +430,33 @@ func (h *HistoryHandler) resolveMetadata(ctx context.Context, repoID int64, owne
 		}
 		return serving.RepositoryMetadata{}, fmt.Errorf("metadata provider is not configured")
 	}
+	h.telemetry.MetadataCacheMiss()
+	// 同一仓库的并发冷启动共享一次回源。没有它，N 个并发请求就是 N 次 GitHub 调用 ——
+	// 而"一个仓库的 README 首次被看到"恰好就是这种突发形态。
+	value, err := h.flights.Do(ctx, metadataFlightKey(fullName), func() (any, error) {
+		return h.refreshMetadata(ctx, repoID, owner, repo, fullName, cached, found)
+	})
+	if err != nil {
+		return serving.RepositoryMetadata{}, err
+	}
+	return value.(serving.RepositoryMetadata), nil
+}
+
+// refreshMetadata 回源 GitHub 并把结果落到正/负缓存。
+func (h *HistoryHandler) refreshMetadata(
+	ctx context.Context,
+	repoID int64,
+	owner, repo, fullName string,
+	cached serving.RepositoryMetadata,
+	found bool,
+) (serving.RepositoryMetadata, error) {
 	fresh, err := h.metadata.Fetch(ctx, owner, repo)
 	if err != nil {
+		if errors.Is(err, provider.ErrNotFound) {
+			// 不存在的仓库必须留下负缓存：公开入口可以被任意 owner/repo 刷。
+			h.recordNegativeMetadata(ctx, fullName, metadataNegativeNotFound)
+			return serving.RepositoryMetadata{}, err
+		}
 		// GitHub 临时失败时允许使用已经验证过的旧公开元数据，避免外部依赖拖垮历史接口。
 		if found && cached.Visibility == "public" {
 			return cached, nil
@@ -343,46 +466,43 @@ func (h *HistoryHandler) resolveMetadata(ctx context.Context, repoID int64, owne
 	if repoID > 0 && fresh.RepoID != repoID {
 		return serving.RepositoryMetadata{}, provider.ErrNotFound
 	}
-	if err := h.store.SaveMetadata(ctx, fresh); err != nil {
-		return serving.RepositoryMetadata{}, err
-	}
-	return fresh, nil
-}
-
-// resolvePublicMetadata 按 owner/repo 解析公开嵌入所需的不可变 repo ID。
-//
-// README 图片请求不可能携带 Starcat API key，因此先使用完整仓库名缓存，再在 TTL
-// 到期时调用 GitHub 官方 metadata。缓存命中仍需保持 Public 门禁，避免仓库变私有后
-// 继续把历史曲线暴露给公开图片地址。
-func (h *HistoryHandler) resolvePublicMetadata(ctx context.Context, owner, repo string) (serving.RepositoryMetadata, error) {
-	fullName := owner + "/" + repo
-	cached, found, err := h.store.MetadataByFullName(ctx, fullName)
-	if err != nil {
-		return serving.RepositoryMetadata{}, err
-	}
-	if found && h.now().UTC().Sub(cached.CheckedAt) < h.metadataTTL {
-		return cached, nil
-	}
-	if h.metadata == nil {
-		if found && cached.Visibility == "public" {
-			return cached, nil
-		}
-		return serving.RepositoryMetadata{}, fmt.Errorf("metadata provider is not configured")
-	}
-	fresh, err := h.metadata.Fetch(ctx, owner, repo)
-	if err != nil {
-		if found && cached.Visibility == "public" {
-			return cached, nil
-		}
-		return serving.RepositoryMetadata{}, err
-	}
 	if fresh.Visibility != "public" {
+		// 仓库存在但不可对外提供：记负缓存后原样返回，由调用方转成 404/422。
+		// 不再落 repository_metadata —— 那张表的口径是"可用公开仓库"。
+		h.recordNegativeMetadata(ctx, fullName, metadataNegativeNotPublic)
 		return fresh, nil
 	}
 	if err := h.store.SaveMetadata(ctx, fresh); err != nil {
 		return serving.RepositoryMetadata{}, err
 	}
+	// 曾经被判不可用、现在已公开：清掉负缓存，否则会在 TTL 内继续被拒。
+	h.clearNegativeMetadata(ctx, fullName)
 	return fresh, nil
+}
+
+// negativeMetadata 读负缓存。缓存故障只降级为"没有负缓存"，不影响请求结果。
+func (h *HistoryHandler) negativeMetadata(ctx context.Context, fullName string) (string, time.Time, bool) {
+	reason, checkedAt, found, err := h.store.NegativeMetadata(ctx, fullName)
+	if err != nil || !found {
+		return "", time.Time{}, false
+	}
+	return reason, checkedAt, true
+}
+
+func (h *HistoryHandler) recordNegativeMetadata(ctx context.Context, fullName, reason string) {
+	if err := h.store.SaveNegativeMetadata(ctx, fullName, reason, h.now().UTC()); err != nil {
+		log.Printf("[handler] save negative metadata cache for %s: %v", fullName, err)
+	}
+}
+
+func (h *HistoryHandler) clearNegativeMetadata(ctx context.Context, fullName string) {
+	if err := h.store.ClearNegativeMetadata(ctx, fullName); err != nil {
+		log.Printf("[handler] clear negative metadata cache for %s: %v", fullName, err)
+	}
+}
+
+func metadataFlightKey(fullName string) string {
+	return "metadata|" + strings.ToLower(strings.TrimSpace(fullName))
 }
 
 func historyETag(repoID int64, historyRange model.HistoryRange, currentStars int, checksum string, active serving.ActiveState) string {

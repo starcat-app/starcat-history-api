@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/starcat-app/starcat-history-api/internal/card"
@@ -33,7 +34,16 @@ const (
 	officialHistoryPerPage        = 30
 	officialHistoryMaxPages       = 100
 	officialHistoryModelName      = "github-history-v1"
+	// officialHistoryFetchConcurrency 是单仓库冷启动时的并行分页数。
+	// 取 4 是按"成熟仓库 20 页左右"估的：把 13 秒压到 3 秒以内，同时不至于让一次
+	// 冷启动就把 GitHub 并发配额吃满（全局闸门在下一个阶段）。
+	officialHistoryFetchConcurrency = 4
 )
+
+// staleCacheHeader 标注"这次返回的是回源失败后的旧数据"。
+// 用独立响应头而不是改 Cache-Control：客户端与 CDN 的缓存策略不变，
+// 运维侧却能一次 curl 就看出数据是不是旧的。
+const staleCacheHeader = "X-Starcat-Cache"
 
 func (h *HistoryHandler) handleOfficialStarHistory(w http.ResponseWriter, r *http.Request) {
 	owner, repo, repoID, ok := parseRepositoryIdentity(w, r)
@@ -62,10 +72,14 @@ func (h *HistoryHandler) handleOfficialStarHistory(w http.ResponseWriter, r *htt
 		currentStars, fullName, repoID = metadata.CurrentStars, metadata.FullName, metadata.RepoID
 	}
 
-	cached, err := h.loadOfficialHistory(r.Context(), owner, repo)
+	loaded, err := h.loadOfficialHistory(r.Context(), owner, repo)
 	if err != nil {
 		h.writeOfficialHistoryError(w, err)
 		return
+	}
+	cached := loaded.value
+	if loaded.stale {
+		w.Header().Set(staleCacheHeader, "stale")
 	}
 	events, err := series.OfficialEvents(cached.Weeks)
 	if err != nil {
@@ -89,7 +103,7 @@ func (h *HistoryHandler) handleOfficialStarHistory(w http.ResponseWriter, r *htt
 	etag := officialHistoryETag(owner, repo, repoID, currentStars, historyRange, cached)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "private, max-age=3600")
-	if r.Header.Get("If-None-Match") == etag {
+	if ifNoneMatch(r.Header.Get("If-None-Match"), etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -106,10 +120,14 @@ func (h *HistoryHandler) handleOfficialStarHistory(w http.ResponseWriter, r *htt
 }
 
 func (h *HistoryHandler) handleOfficialStarHistoryEmbed(w http.ResponseWriter, r *http.Request, owner, repo string, metadata serving.RepositoryMetadata, theme card.Theme, locale card.Locale) {
-	cached, err := h.loadOfficialHistory(r.Context(), owner, repo)
+	loaded, err := h.loadOfficialHistory(r.Context(), owner, repo)
 	if err != nil {
 		h.writeOfficialHistoryError(w, err)
 		return
+	}
+	cached := loaded.value
+	if loaded.stale {
+		w.Header().Set(staleCacheHeader, "stale")
 	}
 	events, err := series.OfficialEvents(cached.Weeks)
 	if err != nil {
@@ -142,9 +160,9 @@ func (h *HistoryHandler) handleOfficialStarHistoryEmbed(w http.ResponseWriter, r
 	}
 	etag := officialEmbedETag(owner, repo, metadata.RepoID, metadata.CurrentStars, cached, theme, locale)
 	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800")
+	w.Header().Set("Cache-Control", embedCacheControl)
 	w.Header().Set("ETag", etag)
-	if r.Header.Get("If-None-Match") == etag {
+	if ifNoneMatch(r.Header.Get("If-None-Match"), etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -162,14 +180,28 @@ func parsePointDate(value string) time.Time {
 	return parsed.UTC()
 }
 
-func (h *HistoryHandler) loadOfficialHistory(ctx context.Context, owner, repo string) (model.GitHubStarHistoryCache, error) {
+// officialHistoryLoad 是一次历史读取的结果。
+//
+// stale 表示"这次吐的是旧曲线，因为回源失败了"。它必须是调用方能感知的信息：
+// 对外要标注（X-Starcat-Cache: stale），否则线上看到的是"响应正常但数据偏旧"，
+// 排查时无从下手。
+type officialHistoryLoad struct {
+	value model.GitHubStarHistoryCache
+	stale bool
+}
+
+func (h *HistoryHandler) loadOfficialHistory(ctx context.Context, owner, repo string) (officialHistoryLoad, error) {
 	key := strings.ToLower(strings.TrimSpace(owner) + "/" + strings.TrimSpace(repo))
 	now := h.now().UTC()
 	if value, ok := h.memory.Get(key, now); ok {
-		return value.(model.GitHubStarHistoryCache), nil
+		h.telemetry.HistoryCacheHit()
+		return value.(officialHistoryLoad), nil
 	}
 	returnValue, err := h.flights.Do(ctx, key, func() (any, error) {
 		if value, ok := h.memory.Get(key, h.now().UTC()); ok {
+			// 并发冷启动里后到的请求：虽然走了 singleflight，但它同样没有回源
+			// GitHub，计入命中才能让「命中率」反映真实的回源压力。
+			h.telemetry.HistoryCacheHit()
 			return value, nil
 		}
 		var cached model.GitHubStarHistoryCache
@@ -183,26 +215,44 @@ func (h *HistoryHandler) loadOfficialHistory(ctx context.Context, owner, repo st
 		}
 		now := h.now().UTC()
 		if found && now.Sub(cached.FetchedAt) < officialHistoryCacheTTL {
-			h.memory.Set(key, cached, now, h.officialMemoryCacheTTL)
-			return cached, nil
+			h.telemetry.HistoryCacheHit()
+			h.memory.Set(key, officialHistoryLoad{value: cached}, now, h.officialMemoryCacheTTL)
+			return officialHistoryLoad{value: cached}, nil
 		}
+		// 退避窗口内不再打 GitHub：故障期间的重试本身就是放大器。
+		if ok, retryAfter := h.backoff.allow(key, now); !ok {
+			if found && len(cached.Weeks) > 0 {
+				h.telemetry.HistoryStaleServed()
+				stale := officialHistoryLoad{value: cached, stale: true}
+				h.memory.Set(key, stale, now, retryAfter)
+				return stale, nil
+			}
+			// 没有旧数据可吐：按"暂时不可用"处理，让调用方回 429 而不是错误的 404。
+			return nil, provider.ErrRateLimited
+		}
+		h.telemetry.HistoryCacheMiss()
 		refreshed, err := h.refreshOfficialHistory(ctx, owner, repo, cached, found, now)
 		if err != nil {
+			window := h.backoff.failure(key, now)
 			// 官方 API 临时限流或网络抖动时，已验证的旧曲线比让 README 直接
-			// 失败更有价值。不要推进 DB 的 fetched_at，短暂内存兜底后仍会重试。
+			// 失败更有价值。不推进 DB 的 fetched_at，退避窗口内继续吐旧图。
 			if found && len(cached.Weeks) > 0 {
-				h.memory.Set(key, cached, now, time.Minute)
-				return cached, nil
+				h.telemetry.HistoryStaleServed()
+				stale := officialHistoryLoad{value: cached, stale: true}
+				h.memory.Set(key, stale, now, window)
+				return stale, nil
 			}
 			return nil, err
 		}
-		h.memory.Set(key, refreshed, now, h.officialMemoryCacheTTL)
-		return refreshed, nil
+		h.backoff.success(key)
+		loaded := officialHistoryLoad{value: refreshed}
+		h.memory.Set(key, loaded, now, h.officialMemoryCacheTTL)
+		return loaded, nil
 	})
 	if err != nil {
-		return model.GitHubStarHistoryCache{}, err
+		return officialHistoryLoad{}, err
 	}
-	return returnValue.(model.GitHubStarHistoryCache), nil
+	return returnValue.(officialHistoryLoad), nil
 }
 
 func (h *HistoryHandler) refreshOfficialHistory(ctx context.Context, owner, repo string, cached model.GitHubStarHistoryCache, found bool, now time.Time) (model.GitHubStarHistoryCache, error) {
@@ -258,24 +308,102 @@ func (h *HistoryHandler) refreshOfficialHistory(ctx context.Context, owner, repo
 	return refreshed, nil
 }
 
+// fetchCompleteOfficialHistory 拉取完整官方周历史。
+//
+// 两条路径：
+//   - Link 头给出了 rel="last"（生产环境正常情况）：第 2 页起有界并行拉取。
+//     这是冷启动从 13 秒降到 3 秒以内的关键 —— 成熟仓库有 20 页以上，串行拉
+//     每页 0.5 秒，光排队就十几秒，而 README 卡片的第一次展示等不起。
+//   - Link 缺失：退回"逐页拉到空页"的顺序语义，保持对 mock / 旧对端的兼容。
 func (h *HistoryHandler) fetchCompleteOfficialHistory(ctx context.Context, owner, repo string) ([]model.GitHubStarHistoryWeek, string, error) {
-	weeks := make([]model.GitHubStarHistoryWeek, 0)
-	etag := ""
-	for page := 1; page <= officialHistoryMaxPages; page++ {
-		response, err := h.starHistory.StarHistory(ctx, owner, repo, page, officialHistoryPerPage, "")
-		if err != nil {
-			return nil, "", err
-		}
-		if page == 1 {
-			etag = response.ResponseETag
-		}
-		if len(response.Weeks) == 0 {
-			break
-		}
-		weeks = append(weeks, response.Weeks...)
+	first, err := h.starHistory.StarHistory(ctx, owner, repo, 1, officialHistoryPerPage, "")
+	if err != nil {
+		return nil, "", err
 	}
+	etag := first.ResponseETag
+	if len(first.Weeks) == 0 {
+		return nil, etag, nil
+	}
+	weeks := first.Weeks
+
+	lastPage := first.LastPage
+	if lastPage < 2 {
+		if lastPage == 0 {
+			// 对端没给页数：顺序拉到空页为止。
+			for page := 2; page <= officialHistoryMaxPages; page++ {
+				response, err := h.starHistory.StarHistory(ctx, owner, repo, page, officialHistoryPerPage, "")
+				if err != nil {
+					return nil, "", err
+				}
+				if len(response.Weeks) == 0 {
+					break
+				}
+				weeks = append(weeks, response.Weeks...)
+			}
+		}
+		canonical, err := canonicalizeOfficialWeeks(weeks)
+		return canonical, etag, err
+	}
+	if lastPage > officialHistoryMaxPages {
+		lastPage = officialHistoryMaxPages
+	}
+	rest, err := h.fetchOfficialHistoryPages(ctx, owner, repo, 2, lastPage)
+	if err != nil {
+		return nil, "", err
+	}
+	weeks = append(weeks, rest...)
 	canonical, err := canonicalizeOfficialWeeks(weeks)
 	return canonical, etag, err
+}
+
+// fetchOfficialHistoryPages 以 officialHistoryFetchConcurrency 为上限并行拉取 [from, to]。
+//
+// 失败即整体失败，不做部分提交：半份历史比没有历史更难排查（曲线会突然少一段）。
+// 取消只作用于尚未发出的请求，已经回来的页会被丢弃。
+func (h *HistoryHandler) fetchOfficialHistoryPages(ctx context.Context, owner, repo string, from, to int) ([]model.GitHubStarHistoryWeek, error) {
+	if to < from {
+		return nil, nil
+	}
+	parallelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	slots := make(chan struct{}, officialHistoryFetchConcurrency)
+	pages := make([][]model.GitHubStarHistoryWeek, to-from+1)
+	var (
+		waitGroup sync.WaitGroup
+		firstErr  error
+		errOnce   sync.Once
+	)
+	for page := from; page <= to; page++ {
+		waitGroup.Add(1)
+		go func(page int) {
+			defer waitGroup.Done()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-parallelCtx.Done():
+				return
+			}
+			response, err := h.starHistory.StarHistory(parallelCtx, owner, repo, page, officialHistoryPerPage, "")
+			if err != nil {
+				errOnce.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
+			pages[page-from] = response.Weeks
+		}(page)
+	}
+	waitGroup.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	weeks := make([]model.GitHubStarHistoryWeek, 0)
+	for _, chunk := range pages {
+		weeks = append(weeks, chunk...)
+	}
+	return weeks, nil
 }
 
 func canonicalizeOfficialWeeks(weeks []model.GitHubStarHistoryWeek) ([]model.GitHubStarHistoryWeek, error) {
@@ -298,7 +426,7 @@ func (h *HistoryHandler) writeOfficialHistoryError(w http.ResponseWriter, err er
 	switch {
 	case errors.Is(err, provider.ErrNotFound):
 		writeError(w, http.StatusNotFound, "HISTORY_NOT_FOUND", "Star history is not available for this repository.", nil)
-	case errors.Is(err, provider.ErrRateLimited):
+	case isUpstreamBusy(err):
 		w.Header().Set("Retry-After", "60")
 		writeError(w, http.StatusTooManyRequests, "GITHUB_RATE_LIMITED", "GitHub star history is temporarily unavailable.", nil)
 	default:
