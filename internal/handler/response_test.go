@@ -44,7 +44,7 @@ func TestWriteErrorSetsSingleCacheControlAndEnvelope(t *testing.T) {
 		t.Fatalf("writeError must not set Retry-After itself")
 	}
 	var envelope struct {
-		SchemaVersion int                  `json:"schema_version"`
+		SchemaVersion int                 `json:"schema_version"`
 		Error         model.ErrorResponse `json:"error"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
