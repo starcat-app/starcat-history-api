@@ -9,7 +9,7 @@ description = "Starcat Star History 本地快照与增量构建器"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "duckdb>=1.4,<2",
+  "duckdb>=1.4,<3",
   "pytz>=2025.2",
 ]
 
