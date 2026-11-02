@@ -100,7 +100,7 @@ estimatedStars(day) = round(currentStars * cumulativeEvents(day) / totalEvents)
 
 ## 环境要求
 
-- Go 1.25+
+- Go 1.26.10+
 - Docker，仅在验证或构建容器镜像时需要
 
 `GITHUB_TOKENS`（逗号分隔多 token 轮换分摊限额）或 `GITHUB_TOKEN`（单值）可选；未配置时服务运行在 GitHub 匿名限额之下。

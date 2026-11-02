@@ -2,6 +2,10 @@
 
 ## 0.1.1-dev
 
+- Go 工具链与 Docker 构建统一升级到 1.26.10，修复 HTTP、TLS 与证书校验相关标准库漏洞。
+- `golang.org/x/sys` 升级至 v0.44.0，消除未被当前 Linux 服务调用的 Windows Unicode 字符串溢出漏洞记录。
+- CI 按 go.mod 选择工具链，并执行固定版本 govulncheck 的可达漏洞扫描。
+
 - 新增多日 History Delta 自动追赶，按生产水位连续构建、发布并支持失败续跑。
 - 每日运维脚本改用项目虚拟环境，避免 LaunchAgent 缺少全局 `uv` 时失败。
 - 第三方曲线接口支持可选 `current_stars`：合法时跳过 GitHub metadata。

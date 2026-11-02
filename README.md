@@ -98,7 +98,7 @@ Every public point is marked with `source=github_history` and `precision=reconst
 
 ## Requirements
 
-- Go 1.25+
+- Go 1.26.10+
 - Docker, only when validating or building the container image
 
 `GITHUB_TOKENS` (comma-separated pool, round shared across requests) or `GITHUB_TOKEN` (single) is optional; without one the service runs under GitHub's anonymous rate limits.
